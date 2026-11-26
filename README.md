@@ -19,7 +19,7 @@ The grace period covers the second or two the BBS takes to redial after a call, 
 ## What the BBS sees
 
 1. It opens a TCP connection to `BbsPort`. Nothing is sent while it waits.
-2. When a caller is joined, the relay sends `CONNECT` and CR LF. Everything after that is the caller's bytes, untouched: telnet negotiation is passed through for the BBS to handle.
+2. When a caller is joined, the relay sends `CONNECT` and CR LF. Everything after that is the caller's bytes, untouched: telnet negotiation is passed through for the BBS to handle. With telnet detection on (below), the line is `CONNECT TELNET` or `CONNECT RAW` instead.
 3. If the caller hangs up, the relay closes the BBS connection. If the BBS closes its connection, the relay hangs up the caller.
 4. The BBS dials in again to wait for the next caller.
 
@@ -50,6 +50,7 @@ Connections, hangups, and busy and offline callers are logged to the Windows Eve
     "CallerPort": 23,
     "BbsPort": 6400,
     "ReconnectGraceSeconds": 5,
+    "TelnetDetectMilliseconds": 0,
     "Messages": {
       "Connected": "Connecting...\r\n",
       "Busy": "The BBS is busy with another caller. Please try again soon.\r\n",
@@ -64,6 +65,7 @@ Connections, hangups, and busy and offline callers are logged to the Windows Eve
 | `CallerPort` | 23 | Port callers connect to |
 | `BbsPort` | 6400 | Port the BBS dials out to |
 | `ReconnectGraceSeconds` | 5 | How long a caller waits for the BBS to redial before getting `Offline` |
+| `TelnetDetectMilliseconds` | 0 | How long to watch a new caller for telnet negotiation. 0 turns detection off and the BBS gets plain `CONNECT` |
 | `Messages.Connected` | `Connecting...` | Sent to the caller just before they're joined. Empty sends nothing |
 | `Messages.Busy` | see above | Sent when the BBS is on another call |
 | `Messages.Offline` | see above | Sent when the BBS isn't connected |
@@ -75,6 +77,15 @@ Restart-Service TelnetRelay
 ```
 
 Installing a newer version currently replaces `appsettings.json` with the default, so copy yours somewhere safe before upgrading.
+
+### Telnet detection
+
+Telnet clients (SyncTERM, PuTTY, Windows `telnet`) send telnet negotiation the moment they connect. Raw TCP clients, such as most C64 Wi-Fi modems and the C64 Ultimate's modem emulation, send nothing. With `TelnetDetectMilliseconds` above 0 (300 is a good start), the relay waits that long for the caller's first bytes and tells the BBS what it found:
+
+- `CONNECT TELNET` when the first byte is IAC ($FF), so the BBS can answer the negotiation, undouble $FF bytes and double its own.
+- `CONNECT RAW` when the caller sent nothing or something else, so the BBS leaves the data alone.
+
+Whatever the caller sent while the relay was watching is passed to the BBS right after the line, so nothing is lost. A telnet client that waits for the server to negotiate first is reported as `RAW`, which is the same as the relay's behaviour with detection off.
 
 The BBS port has no password. Anyone who finds it can connect and receive the next caller, so if the relay is on the internet, limit that port to your BBS's IP with the firewall rule above.
 
@@ -131,7 +142,7 @@ Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what yo
 dotnet run --project Application\TelnetRelay.Tests
 ```
 
-These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, and binary data with 0xFF bytes passing through unchanged.
+These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection.
 
 ## License
 

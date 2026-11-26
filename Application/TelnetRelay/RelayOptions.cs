@@ -24,6 +24,16 @@ public sealed class RelayOptions
     /// </summary>
     public string BbsConnectLine { get; set; } = "CONNECT\r\n";
 
+    /// <summary>
+    /// How long to watch a new caller for telnet negotiation before joining
+    /// them to the BBS. Telnet clients (SyncTERM, PuTTY, Windows telnet) send
+    /// IAC negotiation as soon as they connect; raw TCP clients (most C64
+    /// Wi-Fi modems) send nothing. When this is above 0, the BBS gets
+    /// "CONNECT TELNET" or "CONNECT RAW" instead of plain "CONNECT", so it
+    /// can turn telnet handling on or off for that call. 0 turns detection off.
+    /// </summary>
+    public int TelnetDetectMilliseconds { get; set; } = 0;
+
     public RelayMessages Messages { get; set; } = new();
 }
 

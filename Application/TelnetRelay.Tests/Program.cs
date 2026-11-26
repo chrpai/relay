@@ -19,6 +19,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("A dead idle BBS connection is not given a caller", DeadIdleBbs),
     ("A new BBS connection replaces an idle one", Replaced),
     ("Next caller is served after the BBS redials", RedialAfterCall),
+    ("Telnet detection: a telnet caller gives CONNECT TELNET, negotiation passed on", DetectTelnet),
+    ("Telnet detection: a silent caller gives CONNECT RAW", DetectRawSilent),
+    ("Telnet detection: a raw caller's first keystroke is passed on", DetectRawTyping),
 };
 
 int failed = 0;
@@ -164,6 +167,38 @@ async Task RedialAfterCall()
     Expect(await ReadExactAsync(next, relay.Options.Messages.Connected.Length), relay.Options.Messages.Connected, "next caller text");
 }
 
+async Task DetectTelnet()
+{
+    await using var relay = await TestRelay.StartAsync(detectMs: 500);
+    using var bbs = await relay.BbsAsync();
+    using var caller = await relay.CallAsync();
+    var negotiation = new byte[] { 255, 253, 3, 255, 251, 24 }; // IAC DO SGA, IAC WILL TTYPE
+    await caller.GetStream().WriteAsync(negotiation);
+    Expect(await ReadExactAsync(bbs, "CONNECT TELNET\r\n".Length), "CONNECT TELNET\r\n", "BBS text");
+    var passed = await ReadBytesAsync(bbs, negotiation.Length);
+    if (!passed.SequenceEqual(negotiation)) throw new Exception("negotiation bytes were not passed on");
+}
+
+async Task DetectRawSilent()
+{
+    await using var relay = await TestRelay.StartAsync(detectMs: 300);
+    using var bbs = await relay.BbsAsync();
+    using var caller = await relay.CallAsync();
+    Expect(await ReadExactAsync(caller, relay.Options.Messages.Connected.Length), relay.Options.Messages.Connected, "caller text");
+    Expect(await ReadExactAsync(bbs, "CONNECT RAW\r\n".Length), "CONNECT RAW\r\n", "BBS text");
+    await bbs.GetStream().WriteAsync(new byte[] { 65 });
+    Expect(await ReadExactAsync(caller, 1), "A", "caller text after connect");
+}
+
+async Task DetectRawTyping()
+{
+    await using var relay = await TestRelay.StartAsync(detectMs: 1000);
+    using var bbs = await relay.BbsAsync();
+    using var caller = await relay.CallAsync();
+    await caller.GetStream().WriteAsync(new byte[] { 13 });
+    Expect(await ReadExactAsync(bbs, "CONNECT RAW\r\n".Length + 1), "CONNECT RAW\r\n\r", "BBS text");
+}
+
 // ---- Helpers -----------------------------------------------------------------
 
 static void Expect(string actual, string expected, string what)
@@ -226,13 +261,14 @@ sealed class TestRelay : IAsyncDisposable
 
     private Task Started { get; }
 
-    public static async Task<TestRelay> StartAsync(int grace = 2)
+    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0)
     {
         var relay = new TestRelay(new RelayOptions
         {
             CallerPort = FreePort(),
             BbsPort = FreePort(),
             ReconnectGraceSeconds = grace,
+            TelnetDetectMilliseconds = detectMs,
         });
         var first = await Task.WhenAny(relay.Started, relay._run).WaitAsync(TimeSpan.FromSeconds(5));
         if (first == relay._run) await relay._run; // surfaces a startup error

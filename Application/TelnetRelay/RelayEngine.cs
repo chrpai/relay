@@ -250,12 +250,28 @@ public sealed class RelayEngine
 
     private async Task RunCallAsync(Socket caller, Socket bbs, string who, CancellationToken ct)
     {
-        _log(RelayLogLevel.Information, $"Caller {who} connected to the BBS.");
         var started = DateTime.UtcNow;
         try
         {
             await SendTextAsync(caller, _options.Messages.Connected, ct);
-            await SendTextAsync(bbs, _options.BbsConnectLine, ct);
+
+            string connectLine = _options.BbsConnectLine;
+            ReadOnlyMemory<byte> early = ReadOnlyMemory<byte>.Empty;
+            string kind = "";
+            if (_options.TelnetDetectMilliseconds > 0)
+            {
+                early = await ReadEarlyBytesAsync(caller, _options.TelnetDetectMilliseconds, ct);
+                bool telnet = early.Length > 0 && early.Span[0] == 0xFF; // IAC
+                kind = telnet ? "TELNET" : "RAW";
+                connectLine = AddWord(connectLine, kind);
+            }
+
+            _log(RelayLogLevel.Information,
+                $"Caller {who} connected to the BBS{(kind == "" ? "" : $" ({kind.ToLowerInvariant()})")}.");
+
+            await SendTextAsync(bbs, connectLine, ct);
+            if (early.Length > 0)
+                await SendBytesAsync(bbs, early, ct);
 
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             var up = PumpAsync(caller, bbs, cts.Token);
@@ -263,7 +279,7 @@ public sealed class RelayEngine
 
             var first = await Task.WhenAny(up, down);
             cts.Cancel();
-            long toBbs = await up;
+            long toBbs = await up + early.Length;
             long toCaller = await down;
 
             string side = first == up ? "caller" : "BBS";
@@ -305,15 +321,45 @@ public sealed class RelayEngine
         return total;
     }
 
+    /// <summary>
+    /// Waits up to <paramref name="milliseconds"/> for the caller's first
+    /// bytes and returns them (empty if nothing arrived or the caller left).
+    /// The bytes are passed on to the BBS after the CONNECT line.
+    /// </summary>
+    private static async Task<ReadOnlyMemory<byte>> ReadEarlyBytesAsync(Socket caller, int milliseconds, CancellationToken ct)
+    {
+        var buffer = new byte[512];
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        wait.CancelAfter(milliseconds);
+        try
+        {
+            int n = await caller.ReceiveAsync(buffer, SocketFlags.None, wait.Token);
+            return buffer.AsMemory(0, n);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return ReadOnlyMemory<byte>.Empty; }
+        catch (SocketException) { return ReadOnlyMemory<byte>.Empty; }
+    }
+
+    /// <summary>"CONNECT\r\n" + "TELNET" gives "CONNECT TELNET\r\n".</summary>
+    private static string AddWord(string line, string word)
+    {
+        string body = line.TrimEnd('\r', '\n');
+        return body + " " + word + line.Substring(body.Length);
+    }
+
     // ---- Helpers ----------------------------------------------------------
 
     private static async Task SendTextAsync(Socket socket, string text, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(text)) return;
-        var bytes = Latin1.GetBytes(text);
+        await SendBytesAsync(socket, Latin1.GetBytes(text), ct);
+    }
+
+    private static async Task SendBytesAsync(Socket socket, ReadOnlyMemory<byte> bytes, CancellationToken ct)
+    {
         int sent = 0;
         while (sent < bytes.Length)
-            sent += await socket.SendAsync(bytes.AsMemory(sent), SocketFlags.None, ct);
+            sent += await socket.SendAsync(bytes.Slice(sent), SocketFlags.None, ct);
     }
 
     /// <summary>
