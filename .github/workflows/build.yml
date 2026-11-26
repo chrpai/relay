@@ -1,0 +1,42 @@
+# Shared build: runs the tests, publishes the service and builds the MSI.
+# Called by ci.yml and release.yml; uploads the MSI as the "relay-msi" artifact.
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to stamp on TelnetRelay.exe and the MSI (major.minor.patch)
+        type: string
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run tests
+        run: dotnet run --project Application/TelnetRelay.Tests -c Release
+
+      - name: Publish application to Installer/Deploy
+        run: >
+          dotnet publish Application/TelnetRelay/TelnetRelay.csproj -c Release
+          -p:PublishProfile=FolderProfile
+          -p:Version=${{ inputs.version }}
+
+      - name: Build installer
+        run: >
+          dotnet build Installer/RelayPackage/RelayPackage.iswixproj -c Release
+          -p:Platform=x64
+          -p:MSIProductVersion=${{ inputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-msi
+          path: Installer/RelayPackage/bin/x64/Release/*.msi
+          if-no-files-found: error

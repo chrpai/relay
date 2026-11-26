@@ -1,0 +1,32 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+    <!--
+    MSIProductVersion is defined in RelayPackage.iswixproj as 0.0.1 for local desktop builds.  
+    You should pass in the MSBuild Property 'MSIProductVersion' to override it during an automated build.
+    See http://msdn.microsoft.com/en-us/library/windows/desktop/aa370859%28v=vs.85%29.aspx for information on allowable values.
+  
+    The Product@Id attribute (ProductCode Property) will be a random GUID for each build.  This is to support "Major Upgrades" where each install 
+    is a seamless uninstall/reinstall.
+    -->
+    <Package Name="Relay" Language="1033" Version="$(var.MSIProductVersion)" Manufacturer="ISWIX LLC" UpgradeCode="92EEB102-C4BE-4335-B1B9-1E5E1515879C">
+        <MediaTemplate EmbedCab="yes" />
+        <!-- Major Upgrade Rule to disallow downgrades -->
+        <MajorUpgrade DowngradeErrorMessage="A newer version of [Relay] is already installed." />
+        <Icon Id="Icon.ico" SourceFile="Resources\Icon.ico"/>
+        <Property Id="ARPPRODUCTICON" Value="Icon.ico"></Property>
+        <UI Id="UI">
+            <ui:WixUI Id="WixUI_FeatureTree" />
+            <UIRef Id="WixUI_ErrorProgressText" />
+        </UI>
+        <Property Id="DISABLEADVTSHORTCUTS" Value="1"></Property>
+        <StandardDirectory Id="ProgramFiles6432Folder">
+            <Directory Id="CompanyFolder" Name="ISWIX LLC">
+                <Directory Id="INSTALLLOCATION" Name="Relay">
+                </Directory>
+            </Directory>
+        </StandardDirectory>
+        <Feature Id="Relay" Title="Relay" Description="Installs all the files needed for Relay" Level="1" AllowAdvertise="no" ConfigurableDirectory="INSTALLLOCATION">
+            <ComponentGroupRef Id="RelayComponents" />
+        </Feature>
+        <EnsureTable Id="FeatureComponents"/>
+    </Package>
+</Wix>

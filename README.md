@@ -1,2 +1,138 @@
 # relay
-Telnet Relay
+
+A telnet relay for BBSes that can't accept incoming connections, such as a Commodore 64 BBS on a C64 Ultimate (its UCI network interface can only dial out), or any BBS behind CGNAT.
+
+The BBS dials out to the relay and waits. When a caller connects to the relay, the relay sends the BBS a `CONNECT` line and passes bytes both ways until either side hangs up. Then the BBS dials back in for the next caller.
+
+It is single-line: one caller at a time. It runs as a Windows service, with its settings in `appsettings.json`.
+
+## What callers see
+
+| Situation | Caller gets |
+| --- | --- |
+| BBS is connected and waiting | The `Connected` message, then the BBS |
+| BBS is on a call with someone else | The `Busy` message, then disconnect |
+| BBS isn't connected | Waits up to `ReconnectGraceSeconds` for it to redial, then the `Offline` message and disconnect |
+
+The grace period covers the second or two the BBS takes to redial after a call, so a caller who arrives right then is joined instead of being told the BBS is offline.
+
+## What the BBS sees
+
+1. It opens a TCP connection to `BbsPort`. Nothing is sent while it waits.
+2. When a caller is joined, the relay sends `CONNECT` and CR LF. Everything after that is the caller's bytes, untouched: telnet negotiation is passed through for the BBS to handle.
+3. If the caller hangs up, the relay closes the BBS connection. If the BBS closes its connection, the relay hangs up the caller.
+4. The BBS dials in again to wait for the next caller.
+
+If a second BBS connection arrives while one is already waiting, the new one replaces the old one, so a C64 that resets and redials doesn't leave a dead connection in the way. The relay uses TCP keepalive to notice a BBS or caller that disappears without closing (power off, dropped router connection) within about 45 seconds.
+
+## Install
+
+Run `Relay-<version>.msi`. It installs to `C:\Program Files\ISWIX LLC\Relay` and registers the `TelnetRelay` Windows service, which starts automatically, both now and at boot.
+
+The installer doesn't open the firewall yet. From an elevated PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "Telnet Relay (callers)" -Direction Inbound -Protocol TCP -LocalPort 23 -Action Allow
+New-NetFirewallRule -DisplayName "Telnet Relay (BBS)" -Direction Inbound -Protocol TCP -LocalPort 6400 -Action Allow
+```
+
+To limit the BBS port to your BBS's address, add `-RemoteAddress <its IP>` to the second rule.
+
+Connections, hangups, and busy and offline callers are logged to the Windows Event Log (Windows Logs > Application, source `TelnetRelay`).
+
+## Settings
+
+`appsettings.json`, in the install folder:
+
+```json
+{
+  "Relay": {
+    "CallerPort": 23,
+    "BbsPort": 6400,
+    "ReconnectGraceSeconds": 5,
+    "Messages": {
+      "Connected": "Connecting...\r\n",
+      "Busy": "The BBS is busy with another caller. Please try again soon.\r\n",
+      "Offline": "The BBS is offline right now. Please try again later.\r\n"
+    }
+  }
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CallerPort` | 23 | Port callers connect to |
+| `BbsPort` | 6400 | Port the BBS dials out to |
+| `ReconnectGraceSeconds` | 5 | How long a caller waits for the BBS to redial before getting `Offline` |
+| `Messages.Connected` | `Connecting...` | Sent to the caller just before they're joined. Empty sends nothing |
+| `Messages.Busy` | see above | Sent when the BBS is on another call |
+| `Messages.Offline` | see above | Sent when the BBS isn't connected |
+
+Messages are sent one byte per character, so `\r\n` line endings and `\u00XX` escapes (for PETSCII or CP437 codes) work. Restart the service after changing settings:
+
+```powershell
+Restart-Service TelnetRelay
+```
+
+Installing a newer version currently replaces `appsettings.json` with the default, so copy yours somewhere safe before upgrading.
+
+The BBS port has no password. Anyone who finds it can connect and receive the next caller, so if the relay is on the internet, limit that port to your BBS's IP with the firewall rule above.
+
+## Repository layout
+
+| Folder | Contents |
+| --- | --- |
+| `Application\TelnetRelay` | The service (.NET 10) |
+| `Application\TelnetRelay.Tests` | Scenario tests |
+| `Application\tools` | `fake_bbs.py`, a stand-in BBS for testing |
+| `Installer\RelayPackage` | The IsWiX / WiX installer project |
+| `Installer\Deploy` | Publish output the installer packages (not in source control) |
+
+## Build
+
+Needs the .NET 10 SDK, and Visual Studio with the IsWiX extension for the installer.
+
+1. Open `Application\Application.sln` and publish `TelnetRelay` with the `FolderProfile` profile. It publishes a self-contained win-x64 build to `Installer\Deploy`. From the command line:
+
+   ```powershell
+   dotnet publish Application\TelnetRelay -p:PublishProfile=FolderProfile
+   ```
+
+2. Open `Installer\Installer.slnx` and build `RelayPackage`. The MSI lands in `Installer\RelayPackage\bin\<platform>\<configuration>`. Pass `-p:MSIProductVersion=x.y.z` for a release build; local builds are `0.0.1`.
+
+Publish again before building the installer whenever the application changes, so `Installer\Deploy` is current.
+
+## CI and releases
+
+GitHub Actions builds on Windows with the .NET 10 SDK. Both workflows run the tests, publish the service to `Installer\Deploy` and build the MSI (`.github/workflows/build.yml`).
+
+- **CI** (`ci.yml`) runs on every push to `main` and every pull request. The MSI is versioned `0.0.<run number>` and attached to the run as the `relay-msi` artifact.
+- **Release** (`release.yml`) runs only when you start it: Actions > Release > Run workflow, on `main`. Pick `patch`, `minor` or `major` to increment the latest `vX.Y.Z` tag, or pick `custom` and type a version such as `1.4.0`. It checks that the version is higher than the last release and within Windows Installer's limits (255.255.65535), stamps it on `TelnetRelay.exe` and the MSI, then creates the `vX.Y.Z` tag and a GitHub release with the MSI attached and generated release notes. The first release starts from 0.0.0.
+
+## Try it without a C64
+
+Run the relay in a console:
+
+```powershell
+dotnet run --project Application\TelnetRelay
+```
+
+In another window, start the stand-in BBS:
+
+```powershell
+python Application\tools\fake_bbs.py 127.0.0.1 6400
+```
+
+Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what you type; ESC hangs up.
+
+## Tests
+
+```powershell
+dotnet run --project Application\TelnetRelay.Tests
+```
+
+These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, and binary data with 0xFF bytes passing through unchanged.
+
+## License
+
+MIT

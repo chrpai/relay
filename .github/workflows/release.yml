@@ -1,0 +1,114 @@
+# Manual release. In GitHub: Actions > Release > Run workflow, then pick which
+# part of the version to increment, or pick "custom" and type a version.
+# The new version is based on the highest existing vX.Y.Z tag (0.0.0 if none).
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increment
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+        default: patch
+      version:
+        description: Version to use when "custom" is selected (major.minor.patch, e.g. 1.4.0)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - name: Releases come from main
+        if: github.ref != 'refs/heads/main'
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          echo "::error::Run the release from the main branch (this run is on $BRANCH)."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the version
+        id: next
+        shell: pwsh
+        env:
+          BUMP: ${{ inputs.bump }}
+          CUSTOM: ${{ inputs.version }}
+        run: |
+          $tags = @(git tag --list 'v*' | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } | ForEach-Object { [version]$_.Substring(1) })
+          $latest = $tags | Sort-Object -Descending | Select-Object -First 1
+          if (-not $latest) { $latest = [version]'0.0.0' }
+
+          switch ($env:BUMP) {
+            'major'  { $next = [version]::new($latest.Major + 1, 0, 0) }
+            'minor'  { $next = [version]::new($latest.Major, $latest.Minor + 1, 0) }
+            'patch'  { $next = [version]::new($latest.Major, $latest.Minor, $latest.Build + 1) }
+            'custom' {
+              $custom = "$env:CUSTOM".Trim().TrimStart('v')
+              if ($custom -notmatch '^\d+\.\d+\.\d+$') {
+                throw "With 'custom', enter a version as major.minor.patch, for example 1.4.0 (got '$env:CUSTOM')."
+              }
+              $next = [version]$custom
+            }
+          }
+
+          if ($env:BUMP -ne 'custom' -and "$env:CUSTOM".Trim()) {
+            Write-Output "::warning::Ignored the version '$env:CUSTOM' because '$env:BUMP' was selected, not 'custom'."
+          }
+          if ($next -le $latest -and $tags.Count -gt 0) {
+            throw "Version $next must be higher than the latest release, $latest."
+          }
+          # Windows Installer limits: major and minor 0-255, patch 0-65535.
+          if ($next.Major -gt 255 -or $next.Minor -gt 255 -or $next.Build -gt 65535) {
+            throw "Version $next is outside what Windows Installer allows (255.255.65535)."
+          }
+
+          $v = "$($next.Major).$($next.Minor).$($next.Build)"
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "Releasing **$v** (previous: $latest, bump: $env:BUMP)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Output "Releasing $v (previous: $latest)"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: relay-msi
+          path: dist
+
+      - name: Create tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/*.msi \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Relay $VERSION" \
+            --generate-notes
