@@ -25,6 +25,19 @@ The grace period covers the second or two the BBS takes to redial after a call, 
 
 If a second BBS connection arrives while one is already waiting, the new one replaces the old one, so a C64 that resets and redials doesn't leave a dead connection in the way. The relay uses TCP keepalive to notice a BBS or caller that disappears without closing (power off, dropped router connection) within about 45 seconds.
 
+## Modem link (Image BBS on a C64 Ultimate)
+
+A BBS can instead have the relay act as its modem. It says so by sending $FF $02 as soon as it connects; the Image BBS Ultimate Net driver does this. The relay then:
+
+- answers the BBS's AT commands (`ATZ`, `ATE0V0`, `ATS0=1`, `ATA`, `ATH`, `ATI`; anything else gets OK), with numeric or word results (`V0`/`V1`);
+- when a caller arrives, raises carrier and sends `CONNECT` (with `S0=0` it sends `RING` and waits for `ATA` for up to 30 seconds);
+- dials out for `ATD[T|P]host[:port]` (port 23 by default) and answers `CONNECT` or `NO CARRIER`, so Image Term and network mail work through it;
+- handles telnet for callers it found to be telnet clients (with `TelnetDetectMilliseconds` on): it negotiates echo, suppress-go-ahead and binary mode, strips telnet commands, and doubles $FF toward the caller. The BBS sees plain bytes.
+
+On the link, bytes go both ways with $FF doubled. Escapes: from the relay, $FF $01 is carrier on and $FF $00 carrier off; from the BBS, $FF $00 means DTR dropped, which hangs up the call.
+
+While the link is on a call or dialing out, other callers get the `Busy` message. Plain BBS connections (no hello) work as before.
+
 ## Install
 
 Run `Relay-<version>.msi`. It installs to `C:\Program Files\ISWIX LLC\Relay` and registers the `TelnetRelay` Windows service, which starts automatically, both now and at boot.
@@ -134,7 +147,7 @@ In another window, start the stand-in BBS:
 python Application\tools\fake_bbs.py 127.0.0.1 6400
 ```
 
-Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what you type; ESC hangs up.
+Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what you type; ESC or typing BYE hangs up.
 
 ## Tests
 
@@ -142,7 +155,7 @@ Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what yo
 dotnet run --project Application\TelnetRelay.Tests
 ```
 
-These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection.
+These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection, and the modem link (AT commands, answering, dialing out, telnet callers, hang-ups both ways).
 
 ## License
 

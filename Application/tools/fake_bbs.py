@@ -2,7 +2,8 @@
 """Stand-in for the C64 BBS, for testing the relay without hardware.
 
 Dials the relay's BBS port, waits for CONNECT, then greets the caller and
-echoes what they type. When the call ends it redials, like the real BBS will.
+echoes what they type. ESC or typing BYE hangs up (a C64 has no ESC key).
+When the call ends it redials, like the real BBS will.
 
     python tools/fake_bbs.py relay-host [bbs-port]
 
@@ -26,13 +27,16 @@ while True:
                     raise ConnectionError("relay closed the connection")
                 line += chunk
             print(f"Relay said: {line!r}")
-            s.sendall(b"\r\nWelcome to the fake BBS. Type something; ESC hangs up.\r\n> ")
+            s.sendall(b"\r\nWelcome to the fake BBS. Type something; ESC or BYE hangs up.\r\n> ")
+            typed = b""
             while True:
                 data = s.recv(1024)
                 if not data:
                     print("Caller hung up.")
                     break
-                if b"\x1b" in data:
+                # PETSCII and ASCII letters differ only in case, so compare without it.
+                typed = (typed + data)[-16:]
+                if b"\x1b" in data or b"bye" in typed.lower():
                     s.sendall(b"\r\nBye!\r\n")
                     print("Hanging up.")
                     break

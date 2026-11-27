@@ -13,6 +13,10 @@ public enum RelayLogLevel { Information, Warning, Error }
 /// either side hangs up. Callers who can't be joined get the Busy or Offline
 /// message.
 ///
+/// A BBS that starts with the modem hello ($FF $02), such as the Image BBS
+/// Ultimate Net driver, gets the relay as its modem instead: see
+/// <see cref="ModemLink"/>.
+///
 /// The engine has no dependencies outside the base class library, so it can be
 /// hosted by the Windows service or by a test harness.
 /// </summary>
@@ -25,8 +29,13 @@ public sealed class RelayEngine
 
     private readonly object _gate = new();
     private Socket? _waitingBbs;                                  // BBS connected and idle
-    private TaskCompletionSource<Socket>? _callerWaitingForBbs;   // caller inside the reconnect grace period
+    private TaskCompletionSource<object>? _callerWaitingForBbs;   // caller inside the reconnect grace period:
+                                                                  // gets a Socket (plain BBS) or a ModemLink
+    private readonly List<ModemLink> _links = new();              // BBSes that use the relay as their modem
     private int _activeCalls;
+
+    /// <summary>How long a new BBS connection is watched for the modem hello ($FF $02).</summary>
+    public const int HelloMilliseconds = 300;
 
     public RelayEngine(RelayOptions options, Action<RelayLogLevel, string> log)
     {
@@ -126,10 +135,28 @@ public sealed class RelayEngine
 
     // ---- BBS side ---------------------------------------------------------
 
-    private Task OnBbsAsync(Socket bbs, CancellationToken ct)
+    private async Task OnBbsAsync(Socket bbs, CancellationToken ct)
     {
         string who = Describe(bbs);
-        TaskCompletionSource<Socket>? handTo = null;
+
+        // A BBS that wants the relay to be its modem says so first ($FF $02).
+        var first = await ReadEarlyBytesAsync(bbs, HelloMilliseconds, 2, ct);
+        if (first.Length == 2 && first.Span[0] == 0xff && first.Span[1] == 0x02)
+        {
+            await RunModemLinkAsync(bbs, who, ct);
+            return;
+        }
+        if (first.Length > 0)
+        {
+            _log(RelayLogLevel.Warning, $"BBS {who} sent data before any caller; dropped it.");
+        }
+        if (!IsAlive(bbs))
+        {
+            Close(bbs);
+            return;
+        }
+
+        TaskCompletionSource<object>? handTo = null;
         Socket? replaced = null;
 
         lock (_gate)
@@ -160,7 +187,38 @@ public sealed class RelayEngine
                 Close(replaced);
             }
         }
-        return Task.CompletedTask;
+    }
+
+    private async Task RunModemLinkAsync(Socket bbs, string who, CancellationToken ct)
+    {
+        var link = new ModemLink(bbs, who, _options, _log, LinkAvailable);
+        lock (_gate) _links.Add(link);
+        _log(RelayLogLevel.Information, $"BBS connected from {who} as a modem link; waiting for a caller.");
+        LinkAvailable(link);
+        try
+        {
+            await link.RunAsync(ct);
+        }
+        finally
+        {
+            lock (_gate) _links.Remove(link);
+            _log(RelayLogLevel.Information, $"Modem link from {who} closed.");
+        }
+    }
+
+    /// <summary>A modem link is idle again: give it to a caller who is waiting, if any.</summary>
+    private void LinkAvailable(ModemLink link)
+    {
+        TaskCompletionSource<object>? handTo = null;
+        lock (_gate)
+        {
+            if (_callerWaitingForBbs != null && link.TryReserve())
+            {
+                handTo = _callerWaitingForBbs;
+                _callerWaitingForBbs = null;
+            }
+        }
+        handTo?.TrySetResult(link);
     }
 
     // ---- Caller side ------------------------------------------------------
@@ -168,24 +226,24 @@ public sealed class RelayEngine
     private async Task OnCallerAsync(Socket caller, CancellationToken ct)
     {
         string who = Describe(caller);
-        Socket? bbs = null;
+        object? bbs = null;
         bool busy = false;
-        TaskCompletionSource<Socket>? wait = null;
+        TaskCompletionSource<object>? wait = null;
 
         lock (_gate)
         {
-            bbs = TakeWaitingBbs();
+            bbs = (object?)TakeWaitingBbs() ?? _links.FirstOrDefault(l => l.TryReserve());
             if (bbs != null)
             {
                 _activeCalls++;
             }
-            else if (_activeCalls > 0 || _callerWaitingForBbs != null)
+            else if (_activeCalls > 0 || _callerWaitingForBbs != null || _links.Count > 0)
             {
                 busy = true;
             }
             else
             {
-                wait = new TaskCompletionSource<Socket>(TaskCreationOptions.RunContinuationsAsynchronously);
+                wait = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
                 _callerWaitingForBbs = wait;
             }
         }
@@ -227,7 +285,10 @@ public sealed class RelayEngine
 
         try
         {
-            await RunCallAsync(caller, bbs!, who, ct);
+            if (bbs is ModemLink link)
+                await RunModemCallAsync(caller, link, who, ct);
+            else
+                await RunCallAsync(caller, (Socket)bbs!, who, ct);
         }
         finally
         {
@@ -248,6 +309,40 @@ public sealed class RelayEngine
         return null;
     }
 
+    private async Task RunModemCallAsync(Socket caller, ModemLink link, string who, CancellationToken ct)
+    {
+        var started = DateTime.UtcNow;
+        try
+        {
+            ReadOnlyMemory<byte> early = ReadOnlyMemory<byte>.Empty;
+            bool telnet = false;
+            if (_options.TelnetDetectMilliseconds > 0)
+            {
+                early = await ReadEarlyBytesAsync(caller, _options.TelnetDetectMilliseconds, 512, ct);
+                telnet = early.Length > 0 && early.Span[0] == 0xFF; // IAC
+            }
+            _log(RelayLogLevel.Information,
+                $"Caller {who} rings the modem link from {link.Who}{(telnet ? " (telnet)" : "")}.");
+
+            if (!await link.CallAsync(caller, telnet, early, ct))
+            {
+                _log(RelayLogLevel.Information, $"The BBS didn't answer; caller {who} got the busy message.");
+                await SendAndCloseAsync(caller, _options.Messages.Busy, ct);
+                return;
+            }
+            _log(RelayLogLevel.Information,
+                $"Call from {who} ended after {DateTime.UtcNow - started:hh\\:mm\\:ss}.");
+        }
+        catch (SocketException ex)
+        {
+            _log(RelayLogLevel.Information, $"Call from {who} ended: {ex.Message}");
+        }
+        finally
+        {
+            Close(caller);
+        }
+    }
+
     private async Task RunCallAsync(Socket caller, Socket bbs, string who, CancellationToken ct)
     {
         var started = DateTime.UtcNow;
@@ -260,7 +355,7 @@ public sealed class RelayEngine
             string kind = "";
             if (_options.TelnetDetectMilliseconds > 0)
             {
-                early = await ReadEarlyBytesAsync(caller, _options.TelnetDetectMilliseconds, ct);
+                early = await ReadEarlyBytesAsync(caller, _options.TelnetDetectMilliseconds, 512, ct);
                 bool telnet = early.Length > 0 && early.Span[0] == 0xFF; // IAC
                 kind = telnet ? "TELNET" : "RAW";
                 connectLine = AddWord(connectLine, kind);
@@ -322,22 +417,31 @@ public sealed class RelayEngine
     }
 
     /// <summary>
-    /// Waits up to <paramref name="milliseconds"/> for the caller's first
-    /// bytes and returns them (empty if nothing arrived or the caller left).
-    /// The bytes are passed on to the BBS after the CONNECT line.
+    /// Waits up to <paramref name="milliseconds"/> for the first bytes from
+    /// a new connection and returns them (empty if nothing arrived or it
+    /// closed): up to <paramref name="max"/> bytes, or the first burst when
+    /// <paramref name="max"/> is more than 2. A caller's bytes are passed on
+    /// to the BBS once the call starts.
     /// </summary>
-    private static async Task<ReadOnlyMemory<byte>> ReadEarlyBytesAsync(Socket caller, int milliseconds, CancellationToken ct)
+    private static async Task<ReadOnlyMemory<byte>> ReadEarlyBytesAsync(Socket socket, int milliseconds, int max, CancellationToken ct)
     {
-        var buffer = new byte[512];
+        var buffer = new byte[max];
+        int got = 0;
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
         wait.CancelAfter(milliseconds);
         try
         {
-            int n = await caller.ReceiveAsync(buffer, SocketFlags.None, wait.Token);
-            return buffer.AsMemory(0, n);
+            while (got < max)
+            {
+                int n = await socket.ReceiveAsync(buffer.AsMemory(got), SocketFlags.None, wait.Token);
+                if (n == 0) break;
+                got += n;
+                if (max > 2) break;     // a caller: the first burst is enough
+            }
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return ReadOnlyMemory<byte>.Empty; }
-        catch (SocketException) { return ReadOnlyMemory<byte>.Empty; }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+        catch (SocketException) { }
+        return buffer.AsMemory(0, got);
     }
 
     /// <summary>"CONNECT\r\n" + "TELNET" gives "CONNECT TELNET\r\n".</summary>
