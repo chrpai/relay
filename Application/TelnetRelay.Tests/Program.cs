@@ -38,6 +38,10 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Modem link: a BBS that never sets up again still gets the caller", ModemSetupTimeout),
     ("Modem link: AT commands from the BBS during a call hang up the caller", ModemStrayCommands),
     ("Modem link: a caller typing AT (echoed by the BBS) stays on", ModemEchoedAt),
+    ("Modem link: escape (pause, ESC ESC ESC with S2=27, pause) then ATH0 hangs up", ModemEscapeHangup),
+    ("Modem link: escape then ATO goes back online", ModemEscapeOnline),
+    ("Modem link: +++ inside data is just data", ModemPlusInData),
+    ("Modem link: TraceData with TraceFile writes the trace to a file", ModemTraceFile),
 };
 
 int failed = 0;
@@ -387,6 +391,75 @@ async Task ModemEchoedAt()
     Expect(await ReadExactAsync(caller, 10), "still here", "call still up");
 }
 
+async Task ModemEscapeHangup()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await Modem(relay);
+    await Send(bbs, "ATS0=1S2=27\r");                         // as Image's init
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "init");
+    using var caller = await relay.CallAsync();
+    Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "carrier, CONNECT");
+    await Task.Delay(300);                                    // Image: &,22,15
+    foreach (var _ in Enumerable.Range(0, 3))
+    {
+        await Send(bbs, "\x1b");                              // ESC, &,22,5 apart
+        await Task.Delay(80);
+    }
+    await Task.Delay(250);
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "OK: command mode");
+    await Send(bbs, "+++");                                   // Image sends these too
+    await Task.Delay(170);
+    await Send(bbs, "ath0\r");
+    await ExpectClosedAsync(caller, "caller");
+    var got = await ReadExactAsync(bbs, 4);
+    if (got != "0\r\xff\x00" && got != "\xff\x00" + "0\r") throw new Exception("after ATH0: " + Convert.ToHexString(Encoding.Latin1.GetBytes(got)));
+}
+
+async Task ModemEscapeOnline()
+{
+    var (relay, bbs, caller) = await ModemCall();
+    await using var _ = relay; using var b = bbs; using var c = caller;
+    await Task.Delay(300);
+    await Send(bbs, "+++");
+    Expect(await ReadExactAsync(caller, 3), "+++", "the escape reaches the caller, as with a modem");
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "OK: command mode");
+    await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("lost"));
+    await Task.Delay(100);
+    await Send(bbs, "ATO\r");
+    Expect(await ReadExactAsync(bbs, 2), "1\r", "CONNECT: online again");
+    await Send(bbs, "back");
+    Expect(await ReadExactAsync(caller, 4), "back", "data flows again");
+    await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("hi"));
+    Expect(await ReadExactAsync(bbs, 2), "hi", "caller's data, without what was sent in command mode");
+}
+
+async Task ModemPlusInData()
+{
+    var (relay, bbs, caller) = await ModemCall();
+    await using var _ = relay; using var b = bbs; using var c = caller;
+    await Send(bbs, "a+++b");                                 // no pause before
+    Expect(await ReadExactAsync(caller, 5), "a+++b", "data");
+    await Task.Delay(400);
+    await Send(bbs, "x");
+    Expect(await ReadExactAsync(caller, 1), "x", "still online");
+    if (bbs.Available > 0) throw new Exception("the relay answered: " + bbs.Available + " bytes");
+}
+
+async Task ModemTraceFile()
+{
+    string file = Path.Combine(Path.GetTempPath(), $"relay-trace-{Guid.NewGuid():N}", "trace.log");
+    await using var relay = await TestRelay.StartAsync(trace: file);
+    using var bbs = await Modem(relay);
+    using var caller = await relay.CallAsync();
+    Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "carrier, CONNECT");
+    await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("Hi"));
+    Expect(await ReadExactAsync(bbs, 2), "Hi", "data");
+    await Task.Delay(200);
+    string log = File.ReadAllText(file);
+    if (!log.Contains("caller -> relay, 2 bytes: 48 69 | Hi")) throw new Exception("trace file: " + log);
+    Directory.Delete(Path.GetDirectoryName(file)!, true);
+}
+
 async Task ModemSetupTimeout()
 {
     await using var relay = await TestRelay.StartAsync(reinitSeconds: 1);
@@ -524,7 +597,7 @@ sealed class TestRelay : IAsyncDisposable
 
     private Task Started { get; }
 
-    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0, int quietMs = 200, int reinitSeconds = 30)
+    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0, int quietMs = 200, int reinitSeconds = 30, string? trace = null)
     {
         var relay = new TestRelay(new RelayOptions
         {
@@ -535,6 +608,8 @@ sealed class TestRelay : IAsyncDisposable
             AnswerQuietMilliseconds = quietMs,
             ReinitWaitSeconds = reinitSeconds,
             CarrierToConnectMilliseconds = 100,
+            TraceData = trace != null,
+            TraceFile = trace ?? "",
         });
         var first = await Task.WhenAny(relay.Started, relay._run).WaitAsync(TimeSpan.FromSeconds(5));
         if (first == relay._run) await relay._run; // surfaces a startup error

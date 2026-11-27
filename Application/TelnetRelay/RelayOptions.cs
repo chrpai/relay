@@ -57,6 +57,13 @@ public sealed class RelayOptions
     public bool TraceData { get; set; } = false;
 
     /// <summary>
+    /// Where TraceData writes, instead of the event log: a text file, one
+    /// line per chunk with the time. A relative path is relative to the
+    /// relay's folder. Empty: the event log.
+    /// </summary>
+    public string TraceFile { get; set; } = "";
+
+    /// <summary>
     /// Modem link only. Time between raising carrier and sending CONNECT.
     /// Image BBS refreshes its carrier flag only now and then, and checks it
     /// right after CONNECT; with no gap it still reads "no carrier" and sends

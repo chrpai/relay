@@ -30,6 +30,7 @@ If a second BBS connection arrives while one is already waiting, the new one rep
 A BBS can instead have the relay act as its modem. It says so by sending $FF $02 as soon as it connects; the Image BBS Ultimate Net driver does this. The relay then:
 
 - answers the BBS's AT commands (`ATZ`, `ATE0V0`, `ATS0=1`, `ATA`, `ATH`, `ATI`; anything else gets OK), with numeric or word results (`V0`/`V1`);
+- supports the Hayes escape during a call, for BBSs set to hang up with an escape code: a pause, three escape characters (`S2`, `+` by default; Image sets ESC), a pause, and the BBS is in command mode with the call still up. `ATH` (or `ATZ`) then hangs up and `ATO` goes back online. Text before `AT` on a command line is ignored, as on a modem;
 - when a caller arrives, raises carrier and sends `CONNECT` (with `S0=0` it sends `RING` and waits for `ATA` for up to 30 seconds);
 - like a real modem, doesn't answer while the BBS is giving it commands: a caller is held until the BBS has sent nothing for `AnswerQuietMilliseconds`, and after a call also until the BBS has set up its modem again, which ends with `ATS0=n` (or it has sent nothing for `ReinitWaitSeconds`). A caller who rings back straight away doesn't see the BBS's `ATZ` and init strings;
 - dials out for `ATD[T|P]host[:port]` (port 23 by default) and answers `CONNECT` or `NO CARRIER`, so Image Term and network mail work through it;
@@ -87,6 +88,7 @@ Connections, hangups, and busy and offline callers are logged to the Windows Eve
 | `ReinitWaitSeconds` | 30 | Modem link: after a call, the longest a caller waits for the BBS to set up its modem again |
 | `CarrierToConnectMilliseconds` | 500 | Modem link: time between raising carrier and sending `CONNECT`, so Image sees the carrier before it checks for it |
 | `TraceData` | false | Modem link, for troubleshooting: logs every chunk of call data in hex, both ways. Busy; leave it off normally |
+| `TraceFile` | (empty) | Where `TraceData` writes instead of the event log: a text file, one timestamped line per chunk. A relative path is relative to the relay's folder |
 | `Messages.Connected` | `Connecting...` | Sent to the caller just before they're joined. Empty sends nothing |
 | `Messages.Busy` | see above | Sent when the BBS is on another call |
 | `Messages.Offline` | see above | Sent when the BBS isn't connected |

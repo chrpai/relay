@@ -12,6 +12,8 @@ namespace TelnetRelay;
 ///   relay -> BBS: $FF $01 carrier on, $FF $00 carrier off
 ///   BBS -> relay: $FF $02 hello, $FF $00 DTR dropped (hang up)
 ///
+/// Escape during a call: a pause, three S2 characters, a pause; then command
+/// mode with the call up (ATH/ATZ hang up, ATO goes back online).
 /// Modem: numeric or word results (V0/V1), echo (E), quiet (Q), S0 (S0 > 0
 /// answers at once: carrier, then CONNECT; S0=0 sends RING and waits for
 /// ATA), ATA, ATD[T|P]host[:port], ATH, ATZ, ATI. Other commands answer OK.
@@ -28,7 +30,7 @@ namespace TelnetRelay;
 /// </summary>
 public sealed class ModemLink
 {
-    private enum State { Command, Ringing, Online, Dialing }
+    private enum State { Command, Ringing, Online, Dialing, OnlineCommand }
 
     private const int RingAnswerSeconds = 30;
     private const int DialSeconds = 30;
@@ -48,6 +50,14 @@ public sealed class ModemLink
     // Hayes settings
     private bool _echo, _verbose, _quiet;
     private int _s0;
+    private byte _s2;                                       // escape character (> 127: none)
+
+    // escape to command mode during a call: guard time, 3 escape characters,
+    // guard time (Image sets S2=27 and waits 15 jiffies around them)
+    private const int GuardMilliseconds = 150;
+    private const int EscapeGapMilliseconds = 1000;
+    private long _lastBbsDataAt;
+    private int _escapes;
     private readonly StringBuilder _line = new();
 
     // the call
@@ -89,6 +99,7 @@ public sealed class ModemLink
         _verbose = false;
         _quiet = false;
         _s0 = 1;
+        _s2 = (byte)'+';
     }
 
     /// <summary>Claims the modem for a caller if it is idle.</summary>
@@ -141,6 +152,7 @@ public sealed class ModemLink
                     if (state == State.Online)
                     {
                         toPeer.Add(b);
+                        EscapeByte(b);
                         if (StrayCommand(b))
                         {
                             await FlushToPeerAsync(toPeer, ct);
@@ -250,6 +262,36 @@ public sealed class ModemLink
 
     // ---- Hayes commands ---------------------------------------------------------
 
+    /// <summary>
+    /// Hayes escape: a pause, three escape characters (S2) close together, a
+    /// pause. Then command mode with the call still up: ATH hangs up, ATO
+    /// goes back online.
+    /// </summary>
+    private void EscapeByte(byte b)
+    {
+        long now = Environment.TickCount64;
+        long gap = now - _lastBbsDataAt;
+        _lastBbsDataAt = now;
+        if (_s2 > 127 || b != _s2) { _escapes = 0; return; }
+        bool ok = _escapes == 0 ? gap >= GuardMilliseconds : gap < EscapeGapMilliseconds;
+        _escapes = ok ? _escapes + 1 : 0;
+        if (_escapes < 3) return;
+        _escapes = 0;
+        long mark = now;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(GuardMilliseconds);
+            lock (_lock)
+            {
+                if (_state != State.Online || _lastBbsDataAt != mark) return;
+                _state = State.OnlineCommand;
+                _line.Clear();
+            }
+            _log(RelayLogLevel.Information, $"BBS {Who} escaped to command mode during a call.");
+            await ResultAsync(0, CancellationToken.None);   // OK
+        });
+    }
+
     private async Task CommandByteAsync(byte b, CancellationToken ct)
     {
         lock (_lock) _lastCommandAt = Environment.TickCount64;
@@ -267,7 +309,16 @@ public sealed class ModemLink
             if (_line.Length > 0) _line.Length--;
         }
         else if (b >= 32 && _line.Length < 80)
+        {
             _line.Append(c);
+            // like a modem, look for "AT": anything before it (the "+++"
+            // Image sends after its escape, say) is dropped
+            if (_line.Length <= 2 && !"AT".StartsWith(_line.ToString()))
+            {
+                _line.Clear();
+                if (c == 'A') _line.Append(c);
+            }
+        }
     }
 
     private async Task LineAsync(string line, CancellationToken ct)
@@ -288,6 +339,19 @@ public sealed class ModemLink
                     return;
                 case 'Z':
                     Reset();
+                    if (InCallCommand()) HangUp();                  // ATZ hangs up, as a modem's does
+                    break;
+                case 'H':
+                    if (Digit(line, ref i) == 0 && InCallCommand()) HangUp();
+                    break;
+                case 'O':
+                    Digit(line, ref i);
+                    if (InCallCommand())
+                    {
+                        lock (_lock) _state = State.Online;
+                        await ResultAsync(1, ct);           // CONNECT: back online
+                        return;
+                    }
                     break;
                 case 'E': _echo = Digit(line, ref i) != 0; break;
                 case 'V': _verbose = Digit(line, ref i) != 0; break;
@@ -299,6 +363,7 @@ public sealed class ModemLink
                     {
                         i++;
                         int value = Number(line, ref i);
+                        if (reg == 2) _s2 = (byte)Math.Min(value, 255);
                         if (reg == 0)
                         {
                             _s0 = value;
@@ -329,6 +394,11 @@ public sealed class ModemLink
             }
         }
         await ResultAsync(0, ct);
+    }
+
+    private bool InCallCommand()
+    {
+        lock (_lock) return _state == State.OnlineCommand;
     }
 
     private static int Digit(string s, ref int i)
@@ -438,6 +508,8 @@ public sealed class ModemLink
     {
         _onlineLine.Clear();
         _strayLines = 0;
+        _escapes = 0;
+        _lastBbsDataAt = Environment.TickCount64;
         Interlocked.Exchange(ref _lastPeerAt, 0);
         lock (_lock)
         {
@@ -498,6 +570,7 @@ public sealed class ModemLink
     {
         Interlocked.Exchange(ref _lastPeerAt, Environment.TickCount64);
         Trace("caller -> relay", bytes);
+        if (InCallCommand()) return;                        // the BBS is talking to its modem
         if (filter == null)
         {
             await SendDataAsync(bytes, ct);
@@ -623,7 +696,33 @@ public sealed class ModemLink
             text.Append(b is >= 32 and < 127 ? (char)b : '.');
         }
         string more = bytes.Length > Max ? $" (+{bytes.Length - Max} more)" : "";
-        _log(RelayLogLevel.Information, $"{Who} {direction}, {bytes.Length} bytes{more}: {hex}| {text}");
+        string message = $"{Who} {direction}, {bytes.Length} bytes{more}: {hex}| {text}";
+        if (string.IsNullOrWhiteSpace(_options.TraceFile))
+            _log(RelayLogLevel.Information, message);
+        else
+            TraceToFile(message);
+    }
+
+    private static readonly object TraceFileLock = new();
+
+    private void TraceToFile(string message)
+    {
+        try
+        {
+            string path = Path.IsPathRooted(_options.TraceFile)
+                ? _options.TraceFile
+                : Path.Combine(AppContext.BaseDirectory, _options.TraceFile);
+            string? dir = Path.GetDirectoryName(path);
+            lock (TraceFileLock)
+            {
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}  {message}{Environment.NewLine}");
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _log(RelayLogLevel.Warning, $"Can't write the trace file ({ex.Message}): {message}");
+        }
     }
 
     private static async Task SendAllAsync(Socket socket, byte[] bytes, CancellationToken ct)
