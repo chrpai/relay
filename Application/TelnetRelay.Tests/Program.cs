@@ -33,6 +33,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Modem link: ATD dials out", ModemDial),
     ("Modem link: ATD to nowhere answers NO CARRIER", ModemDialFails),
     ("Modem link: link gone mid-call hangs up the caller", ModemLinkGone),
+    ("Modem link: a caller after a call waits for the BBS's modem setup", ModemWaitsForSetup),
+    ("Modem link: a caller isn't answered while the BBS sends commands", ModemWaitsForQuiet),
+    ("Modem link: a BBS that never sets up again still gets the caller", ModemSetupTimeout),
 };
 
 int failed = 0;
@@ -309,8 +312,52 @@ async Task ModemBusyThenNext()
         Expect(await ReadAllAsync(second), relay.Options.Messages.Busy, "second caller");
     caller.Dispose();
     Expect(await ReadExactAsync(bbs, 2), "\xff\x00", "first call over");
+    await Send(bbs, "ATZ\r");                                // the BBS sets its modem up again
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "ATZ");
     using var next = await relay.CallAsync();
     Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "next caller");
+}
+
+async Task ModemWaitsForSetup()
+{
+    var (relay, bbs, caller) = await ModemCall();
+    await using var _ = relay; using var b = bbs;
+    caller.Dispose();
+    Expect(await ReadExactAsync(bbs, 2), "\xff\x00", "first call over");
+    using var next = await relay.CallAsync();                 // rings back at once
+    await Task.Delay(400);
+    if (bbs.Available > 0) throw new Exception("answered before the BBS set its modem up");
+    await Send(bbs, "ATZ\r");
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "ATZ");
+    await Send(bbs, "ATE0V0S0=1\r");
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "init");
+    Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "answered after the setup");
+    Expect(await ReadExactAsync(next, relay.Options.Messages.Connected.Length), relay.Options.Messages.Connected, "caller text");
+    await Send(bbs, "X");
+    Expect(await ReadExactAsync(next, 1), "X", "only BBS data reaches the caller, no commands");
+}
+
+async Task ModemWaitsForQuiet()
+{
+    await using var relay = await TestRelay.StartAsync(quietMs: 600);
+    using var bbs = await Modem(relay);
+    await Send(bbs, "ATZ\r");
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "ATZ");
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    using var caller = await relay.CallAsync();
+    Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "answered once quiet");
+    if (sw.ElapsedMilliseconds < 400) throw new Exception($"answered after {sw.ElapsedMilliseconds} ms, during the commands");
+}
+
+async Task ModemSetupTimeout()
+{
+    await using var relay = await TestRelay.StartAsync(reinitSeconds: 1);
+    using var bbs = await Modem(relay);
+    using (var first = await relay.CallAsync())
+        Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "first caller");
+    Expect(await ReadExactAsync(bbs, 2), "\xff\x00", "first call over");
+    using var next = await relay.CallAsync();                 // the BBS sends nothing
+    Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "answered after ReinitWaitSeconds");
 }
 
 async Task ModemTelnetCaller()
@@ -439,7 +486,7 @@ sealed class TestRelay : IAsyncDisposable
 
     private Task Started { get; }
 
-    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0)
+    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0, int quietMs = 200, int reinitSeconds = 30)
     {
         var relay = new TestRelay(new RelayOptions
         {
@@ -447,6 +494,8 @@ sealed class TestRelay : IAsyncDisposable
             BbsPort = FreePort(),
             ReconnectGraceSeconds = grace,
             TelnetDetectMilliseconds = detectMs,
+            AnswerQuietMilliseconds = quietMs,
+            ReinitWaitSeconds = reinitSeconds,
         });
         var first = await Task.WhenAny(relay.Started, relay._run).WaitAsync(TimeSpan.FromSeconds(5));
         if (first == relay._run) await relay._run; // surfaces a startup error

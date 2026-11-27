@@ -18,6 +18,12 @@ namespace TelnetRelay;
 /// The stored profile is E0 V0 S0=1, which is what Image sets up anyway.
 /// When a caller hangs up the carrier drops; NO CARRIER is only sent for
 /// calls the BBS dialed.
+///
+/// Like a real modem, which can't answer while the BBS is giving it commands,
+/// a caller is only answered once the BBS has been quiet for
+/// AnswerQuietMilliseconds; after a call, also only once the BBS has reset
+/// and set up its modem again (or ReinitWaitSeconds have passed). Otherwise
+/// a caller who rings back at once would see those commands as text.
 /// </summary>
 public sealed class ModemLink
 {
@@ -50,6 +56,11 @@ public sealed class ModemLink
     private CancellationTokenSource? _dial;
     private bool _hungUpHere;
     private bool _dialedOut;
+
+    // modem setup by the BBS (Environment.TickCount64 times)
+    private long _lastCommandAt = long.MinValue / 2;
+    private long _callEndedAt;
+    private bool _awaitSetup;                               // a call ended; no AT command since
 
     public string Who { get; }
 
@@ -145,6 +156,7 @@ public sealed class ModemLink
     private async Task FlushToPeerAsync(List<byte> data, CancellationToken ct)
     {
         if (data.Count == 0) return;
+        Trace("BBS -> caller", data.ToArray());
         Socket? peer;
         TelnetFilter? telnet;
         lock (_lock) { peer = _peer; telnet = _telnet; }
@@ -223,6 +235,7 @@ public sealed class ModemLink
 
     private async Task CommandByteAsync(byte b, CancellationToken ct)
     {
+        lock (_lock) _lastCommandAt = Environment.TickCount64;
         if (_echo) await SendDataAsync(new[] { b }, ct);
         if (b is >= 0xc1 and <= 0xda) b -= 0x80;           // PETSCII shifted letters
         char c = char.ToUpperInvariant((char)b);
@@ -244,6 +257,7 @@ public sealed class ModemLink
     {
         line = line.Trim();
         if (!line.StartsWith("AT")) return;
+        lock (_lock) _awaitSetup = false;
         int i = 2;
         while (i < line.Length)
         {
@@ -336,6 +350,8 @@ public sealed class ModemLink
             _dialedOut = false;
         }
 
+        await WaitForSetupAsync(ct);
+
         // Image takes any result code at idle for a call, so with S0 > 0
         // there is no RING: carrier, then CONNECT, as a modem that has
         // answered. S0=0 rings and waits for ATA.
@@ -368,6 +384,32 @@ public sealed class ModemLink
             await FromPeerAsync(caller, filter, early.Span.ToArray(), ct);
         await PumpPeerAsync(caller, filter, ct);
         return true;
+    }
+
+    /// <summary>
+    /// Holds a new caller while the BBS is still giving its modem commands
+    /// (after a call it resets and sets the modem up again).
+    /// </summary>
+    private async Task WaitForSetupAsync(CancellationToken ct)
+    {
+        bool logged = false;
+        while (true)
+        {
+            long now = Environment.TickCount64;
+            bool setup, dead;
+            long last, ended;
+            lock (_lock) { setup = _awaitSetup; last = _lastCommandAt; ended = _callEndedAt; dead = _dead; }
+            if (dead) return;
+            bool setupDone = !setup || now - ended >= _options.ReinitWaitSeconds * 1000L;
+            bool quiet = now - last >= _options.AnswerQuietMilliseconds;
+            if (setupDone && quiet) return;
+            if (!logged)
+            {
+                _log(RelayLogLevel.Information, $"Caller waits while BBS {Who} sets up its modem.");
+                logged = true;
+            }
+            await Task.Delay(50, ct);
+        }
     }
 
     private async Task StartOnlineAsync(Socket peer, TelnetFilter? filter, CancellationToken ct)
@@ -410,6 +452,8 @@ public sealed class ModemLink
                 _telnet = null;
                 _state = State.Command;
                 _reserved = false;
+                _awaitSetup = true;
+                _callEndedAt = Environment.TickCount64;
             }
             CloseQuietly(peer);
             if (!_dead && !ct.IsCancellationRequested)
@@ -425,6 +469,7 @@ public sealed class ModemLink
 
     private async Task FromPeerAsync(Socket peer, TelnetFilter? filter, byte[] bytes, CancellationToken ct)
     {
+        Trace("caller -> relay", bytes);
         if (filter == null)
         {
             await SendDataAsync(bytes, ct);
@@ -433,6 +478,7 @@ public sealed class ModemLink
         var data = new List<byte>(bytes.Length);
         var reply = new List<byte>();
         filter.FromClient(bytes, data, reply);
+        Trace("relay -> BBS (telnet removed)", data.ToArray());
         if (reply.Count > 0) await SendAllAsync(peer, reply.ToArray(), ct);
         if (data.Count > 0) await SendDataAsync(data.ToArray(), ct);
     }
@@ -508,6 +554,24 @@ public sealed class ModemLink
     }
 
     // ---- helpers -----------------------------------------------------------------------
+
+    /// <summary>TraceData: one log entry per chunk, hex and printable text.</summary>
+    private void Trace(string direction, byte[] bytes)
+    {
+        if (!_options.TraceData || bytes.Length == 0) return;
+        const int Max = 256;
+        int n = Math.Min(bytes.Length, Max);
+        var hex = new StringBuilder(n * 3);
+        var text = new StringBuilder(n);
+        for (int i = 0; i < n; i++)
+        {
+            byte b = bytes[i];
+            hex.Append(b.ToString("X2")).Append(' ');
+            text.Append(b is >= 32 and < 127 ? (char)b : '.');
+        }
+        string more = bytes.Length > Max ? $" (+{bytes.Length - Max} more)" : "";
+        _log(RelayLogLevel.Information, $"{Who} {direction}, {bytes.Length} bytes{more}: {hex}| {text}");
+    }
 
     private static async Task SendAllAsync(Socket socket, byte[] bytes, CancellationToken ct)
     {

@@ -31,6 +31,7 @@ A BBS can instead have the relay act as its modem. It says so by sending $FF $02
 
 - answers the BBS's AT commands (`ATZ`, `ATE0V0`, `ATS0=1`, `ATA`, `ATH`, `ATI`; anything else gets OK), with numeric or word results (`V0`/`V1`);
 - when a caller arrives, raises carrier and sends `CONNECT` (with `S0=0` it sends `RING` and waits for `ATA` for up to 30 seconds);
+- like a real modem, doesn't answer while the BBS is giving it commands: a caller is held until the BBS has sent nothing for `AnswerQuietMilliseconds`, and after a call also until the BBS has reset and set up its modem again (up to `ReinitWaitSeconds`). A caller who rings back straight away doesn't see the BBS's `ATZ` and init strings;
 - dials out for `ATD[T|P]host[:port]` (port 23 by default) and answers `CONNECT` or `NO CARRIER`, so Image Term and network mail work through it;
 - handles telnet for callers it found to be telnet clients (with `TelnetDetectMilliseconds` on): it negotiates echo, suppress-go-ahead and binary mode, strips telnet commands, and doubles $FF toward the caller. The BBS sees plain bytes.
 
@@ -64,6 +65,8 @@ Connections, hangups, and busy and offline callers are logged to the Windows Eve
     "BbsPort": 6400,
     "ReconnectGraceSeconds": 5,
     "TelnetDetectMilliseconds": 0,
+    "AnswerQuietMilliseconds": 1000,
+    "ReinitWaitSeconds": 30,
     "Messages": {
       "Connected": "Connecting...\r\n",
       "Busy": "The BBS is busy with another caller. Please try again soon.\r\n",
@@ -79,6 +82,9 @@ Connections, hangups, and busy and offline callers are logged to the Windows Eve
 | `BbsPort` | 6400 | Port the BBS dials out to |
 | `ReconnectGraceSeconds` | 5 | How long a caller waits for the BBS to redial before getting `Offline` |
 | `TelnetDetectMilliseconds` | 0 | How long to watch a new caller for telnet negotiation. 0 turns detection off and the BBS gets plain `CONNECT` |
+| `AnswerQuietMilliseconds` | 1000 | Modem link: a caller is answered only once the BBS has sent no modem commands for this long |
+| `ReinitWaitSeconds` | 30 | Modem link: after a call, the longest a caller waits for the BBS to set up its modem again |
+| `TraceData` | false | Modem link, for troubleshooting: logs every chunk of call data in hex, both ways. Busy; leave it off normally |
 | `Messages.Connected` | `Connecting...` | Sent to the caller just before they're joined. Empty sends nothing |
 | `Messages.Busy` | see above | Sent when the BBS is on another call |
 | `Messages.Offline` | see above | Sent when the BBS isn't connected |
@@ -155,7 +161,7 @@ Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what yo
 dotnet run --project Application\TelnetRelay.Tests
 ```
 
-These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection, and the modem link (AT commands, answering, dialing out, telnet callers, hang-ups both ways).
+These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection, and the modem link (AT commands, answering, dialing out, telnet callers, hang-ups both ways, holding a caller while the BBS sets up its modem).
 
 ## License
 

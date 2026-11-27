@@ -34,6 +34,28 @@ public sealed class RelayOptions
     /// </summary>
     public int TelnetDetectMilliseconds { get; set; } = 0;
 
+    /// <summary>
+    /// Modem link only. A caller is answered only once the BBS has sent no
+    /// modem commands for this long, so a caller never sees the BBS's reset
+    /// and init commands (ATZ, ATE0V0...) that it sends after each call.
+    /// </summary>
+    public int AnswerQuietMilliseconds { get; set; } = 1000;
+
+    /// <summary>
+    /// Modem link only. After a call the BBS resets and sets up its modem
+    /// again; a caller who arrives before that is held until it is done. If
+    /// the BBS sends no commands at all, the caller is answered after this
+    /// many seconds anyway.
+    /// </summary>
+    public int ReinitWaitSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Modem link only, for troubleshooting: logs every chunk of call data
+    /// in hex, both ways (what the caller sent, what the BBS got after
+    /// telnet handling, and what the BBS sent). Busy; leave it off normally.
+    /// </summary>
+    public bool TraceData { get; set; } = false;
+
     public RelayMessages Messages { get; set; } = new();
 }
 
