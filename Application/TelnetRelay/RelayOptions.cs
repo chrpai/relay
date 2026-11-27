@@ -43,9 +43,9 @@ public sealed class RelayOptions
 
     /// <summary>
     /// Modem link only. After a call the BBS resets and sets up its modem
-    /// again; a caller who arrives before that is held until it is done. If
-    /// the BBS sends no commands at all, the caller is answered after this
-    /// many seconds anyway.
+    /// again, ending with ATS0=n; a caller who arrives before that is held
+    /// until it is done. If the BBS sends no commands for this many seconds,
+    /// the caller is answered anyway.
     /// </summary>
     public int ReinitWaitSeconds { get; set; } = 30;
 

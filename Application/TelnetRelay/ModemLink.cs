@@ -21,8 +21,9 @@ namespace TelnetRelay;
 ///
 /// Like a real modem, which can't answer while the BBS is giving it commands,
 /// a caller is only answered once the BBS has been quiet for
-/// AnswerQuietMilliseconds; after a call, also only once the BBS has reset
-/// and set up its modem again (or ReinitWaitSeconds have passed). Otherwise
+/// AnswerQuietMilliseconds; after a call, also only once the BBS has set up
+/// its modem again, which ends with ATS0=n (or it has sent nothing for
+/// ReinitWaitSeconds). A bare AT during the BBS's logoff doesn't count. Otherwise
 /// a caller who rings back at once would see those commands as text.
 /// </summary>
 public sealed class ModemLink
@@ -60,7 +61,14 @@ public sealed class ModemLink
     // modem setup by the BBS (Environment.TickCount64 times)
     private long _lastCommandAt = long.MinValue / 2;
     private long _callEndedAt;
-    private bool _awaitSetup;                               // a call ended; no AT command since
+    private bool _awaitSetup;                               // a call ended; no ATS0= since
+
+    // stray commands during a call (the BBS lost track of the call)
+    private const int StrayCommandLines = 2;
+    private const int EchoMilliseconds = 2000;
+    private readonly StringBuilder _onlineLine = new();
+    private int _strayLines;
+    private long _lastPeerAt;
 
     public string Who { get; }
 
@@ -131,7 +139,16 @@ public sealed class ModemLink
                     State state;
                     lock (_lock) state = _state;
                     if (state == State.Online)
+                    {
                         toPeer.Add(b);
+                        if (StrayCommand(b))
+                        {
+                            await FlushToPeerAsync(toPeer, ct);
+                            _log(RelayLogLevel.Warning,
+                                $"BBS {Who} is sending modem commands during a call (it thinks it is offline); hung up the caller.");
+                            HangUp();
+                        }
+                    }
                     else if (state == State.Dialing)
                         CancelDial();                       // a key aborts the dial
                     else
@@ -257,7 +274,6 @@ public sealed class ModemLink
     {
         line = line.Trim();
         if (!line.StartsWith("AT")) return;
-        lock (_lock) _awaitSetup = false;
         int i = 2;
         while (i < line.Length)
         {
@@ -283,7 +299,11 @@ public sealed class ModemLink
                     {
                         i++;
                         int value = Number(line, ref i);
-                        if (reg == 0) _s0 = value;
+                        if (reg == 0)
+                        {
+                            _s0 = value;
+                            lock (_lock) _awaitSetup = false;   // auto-answer set: setup done
+                        }
                     }
                     else if (i < line.Length && line[i] == '?')
                     {
@@ -400,7 +420,9 @@ public sealed class ModemLink
             long last, ended;
             lock (_lock) { setup = _awaitSetup; last = _lastCommandAt; ended = _callEndedAt; dead = _dead; }
             if (dead) return;
-            bool setupDone = !setup || now - ended >= _options.ReinitWaitSeconds * 1000L;
+            // after a call: wait for the BBS to set S0 again (the end of its
+            // modem setup), unless it has sent no command for ReinitWaitSeconds
+            bool setupDone = !setup || now - Math.Max(ended, last) >= _options.ReinitWaitSeconds * 1000L;
             bool quiet = now - last >= _options.AnswerQuietMilliseconds;
             if (setupDone && quiet) return;
             if (!logged)
@@ -414,6 +436,9 @@ public sealed class ModemLink
 
     private async Task StartOnlineAsync(Socket peer, TelnetFilter? filter, CancellationToken ct)
     {
+        _onlineLine.Clear();
+        _strayLines = 0;
+        Interlocked.Exchange(ref _lastPeerAt, 0);
         lock (_lock)
         {
             _peer = peer;
@@ -471,6 +496,7 @@ public sealed class ModemLink
 
     private async Task FromPeerAsync(Socket peer, TelnetFilter? filter, byte[] bytes, CancellationToken ct)
     {
+        Interlocked.Exchange(ref _lastPeerAt, Environment.TickCount64);
         Trace("caller -> relay", bytes);
         if (filter == null)
         {
@@ -553,6 +579,31 @@ public sealed class ModemLink
             await PumpPeerAsync(peer, null, ct);
             _log(RelayLogLevel.Information, $"BBS {Who}: call to {host}:{port} ended.");
         }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Watches what the BBS sends during a call. A BBS that has lost track of
+    /// the call (Image retrying its modem setup, say) sends AT command lines
+    /// that would go to the caller forever and tie the board up. Two such
+    /// lines in a row, not echoes of what the caller just typed, mean that:
+    /// true to hang up the caller, so the BBS gets its modem back.
+    /// </summary>
+    private bool StrayCommand(byte b)
+    {
+        if (b is >= 0xc1 and <= 0xda) b -= 0x80;           // PETSCII shifted letters
+        if (b is 13 or 10)
+        {
+            if (_onlineLine.Length == 0) return false;
+            string line = _onlineLine.ToString();
+            _onlineLine.Clear();
+            bool command = line.Length >= 2 && line[0] == 'A' && line[1] == 'T'
+                && line.All(c => char.IsLetterOrDigit(c) || "=&*\\%?.:,-+ ".Contains(c));
+            bool echo = Environment.TickCount64 - Interlocked.Read(ref _lastPeerAt) < EchoMilliseconds;
+            if (!command || echo) { _strayLines = 0; return false; }
+            return ++_strayLines >= StrayCommandLines;
+        }
+        if (_onlineLine.Length < 80) _onlineLine.Append(char.ToUpperInvariant((char)b));
+        return false;
     }
 
     // ---- helpers -----------------------------------------------------------------------

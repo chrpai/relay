@@ -31,8 +31,9 @@ A BBS can instead have the relay act as its modem. It says so by sending $FF $02
 
 - answers the BBS's AT commands (`ATZ`, `ATE0V0`, `ATS0=1`, `ATA`, `ATH`, `ATI`; anything else gets OK), with numeric or word results (`V0`/`V1`);
 - when a caller arrives, raises carrier and sends `CONNECT` (with `S0=0` it sends `RING` and waits for `ATA` for up to 30 seconds);
-- like a real modem, doesn't answer while the BBS is giving it commands: a caller is held until the BBS has sent nothing for `AnswerQuietMilliseconds`, and after a call also until the BBS has reset and set up its modem again (up to `ReinitWaitSeconds`). A caller who rings back straight away doesn't see the BBS's `ATZ` and init strings;
+- like a real modem, doesn't answer while the BBS is giving it commands: a caller is held until the BBS has sent nothing for `AnswerQuietMilliseconds`, and after a call also until the BBS has set up its modem again, which ends with `ATS0=n` (or it has sent nothing for `ReinitWaitSeconds`). A caller who rings back straight away doesn't see the BBS's `ATZ` and init strings;
 - dials out for `ATD[T|P]host[:port]` (port 23 by default) and answers `CONNECT` or `NO CARRIER`, so Image Term and network mail work through it;
+- hangs up the caller if, during a call, the BBS sends two AT command lines in a row that aren't echoes of what the caller just typed. That means the BBS has lost track of the call (Image retrying its modem setup, say), and without this a caller could sit there and tie up the board;
 - handles telnet for callers it found to be telnet clients (with `TelnetDetectMilliseconds` on): it negotiates echo, suppress-go-ahead and binary mode, strips telnet commands, and doubles $FF toward the caller. The BBS sees plain bytes.
 
 On the link, bytes go both ways with $FF doubled. Escapes: from the relay, $FF $01 is carrier on and $FF $00 carrier off; from the BBS, $FF $00 means DTR dropped, which hangs up the call.
@@ -162,7 +163,7 @@ Call it with SyncTERM or `telnet 127.0.0.1 23`. It greets you and echoes what yo
 dotnet run --project Application\TelnetRelay.Tests
 ```
 
-These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection, and the modem link (AT commands, answering, dialing out, telnet callers, hang-ups both ways, holding a caller while the BBS sets up its modem).
+These are scenario tests with real sockets on local ports: offline, connected, busy, hangups from each side, the reconnect grace period, a dead idle BBS connection, binary data with 0xFF bytes passing through unchanged, and telnet detection, and the modem link (AT commands, answering, dialing out, telnet callers, hang-ups both ways, holding a caller while the BBS sets up its modem, hanging up when the BBS sends modem commands mid-call).
 
 ## License
 

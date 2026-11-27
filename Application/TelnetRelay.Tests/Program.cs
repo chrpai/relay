@@ -36,6 +36,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Modem link: a caller after a call waits for the BBS's modem setup", ModemWaitsForSetup),
     ("Modem link: a caller isn't answered while the BBS sends commands", ModemWaitsForQuiet),
     ("Modem link: a BBS that never sets up again still gets the caller", ModemSetupTimeout),
+    ("Modem link: AT commands from the BBS during a call hang up the caller", ModemStrayCommands),
+    ("Modem link: a caller typing AT (echoed by the BBS) stays on", ModemEchoedAt),
 };
 
 int failed = 0;
@@ -314,6 +316,8 @@ async Task ModemBusyThenNext()
     Expect(await ReadExactAsync(bbs, 2), "\xff\x00", "first call over");
     await Send(bbs, "ATZ\r");                                // the BBS sets its modem up again
     Expect(await ReadExactAsync(bbs, 2), "0\r", "ATZ");
+    await Send(bbs, "ATS0=1\r");
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "S0=1");
     using var next = await relay.CallAsync();
     Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "next caller");
 }
@@ -325,11 +329,17 @@ async Task ModemWaitsForSetup()
     caller.Dispose();
     Expect(await ReadExactAsync(bbs, 2), "\xff\x00", "first call over");
     using var next = await relay.CallAsync();                 // rings back at once
-    await Task.Delay(400);
+    await Send(bbs, "AT\r");                                 // Image's bare AT during logoff
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "AT");
+    await Task.Delay(700);                                    // quiet, but setup not done
     if (bbs.Available > 0) throw new Exception("answered before the BBS set its modem up");
     await Send(bbs, "ATZ\r");
     Expect(await ReadExactAsync(bbs, 2), "0\r", "ATZ");
-    await Send(bbs, "ATE0V0S0=1\r");
+    await Send(bbs, "ATE0V0\r");
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "E0V0");
+    await Task.Delay(400);
+    if (bbs.Available > 0) throw new Exception("answered in the middle of the setup");
+    await Send(bbs, "ATS0=1S2=27S7=25\r");
     Expect(await ReadExactAsync(bbs, 2), "0\r", "init");
     Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "answered after the setup");
     Expect(await ReadExactAsync(next, relay.Options.Messages.Connected.Length), relay.Options.Messages.Connected, "caller text");
@@ -347,6 +357,34 @@ async Task ModemWaitsForQuiet()
     using var caller = await relay.CallAsync();
     Expect(await ReadExactAsync(bbs, 4), "\xff\x01" + "1\r", "answered once quiet");
     if (sw.ElapsedMilliseconds < 400) throw new Exception($"answered after {sw.ElapsedMilliseconds} ms, during the commands");
+}
+
+async Task ModemStrayCommands()
+{
+    var (relay, bbs, caller) = await ModemCall();
+    await using var _ = relay; using var b = bbs; using var c = caller;
+    await Task.Delay(300);
+    await Send(bbs, "ate0v0h0x1m0b0\r");                     // Image retrying its setup
+    await Send(bbs, "at\r");
+    await ExpectClosedAsync(caller, "caller");
+    Expect(await ReadExactAsync(bbs, 2), "\xff\x00", "carrier off");
+    await Send(bbs, "ate0v0h0x1m0b0\r");                     // and the modem answers again
+    Expect(await ReadExactAsync(bbs, 2), "0\r", "OK in command mode");
+}
+
+async Task ModemEchoedAt()
+{
+    var (relay, bbs, caller) = await ModemCall();
+    await using var _ = relay; using var b = bbs; using var c = caller;
+    for (int i = 0; i < 3; i++)
+    {
+        await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("at\r"));
+        Expect(await ReadExactAsync(bbs, 3), "at\r", "caller's typing");
+        await Send(bbs, "at\r");                             // the BBS echoes it
+        Expect(await ReadExactAsync(caller, 3), "at\r", "echo");
+    }
+    await Send(bbs, "still here");
+    Expect(await ReadExactAsync(caller, 10), "still here", "call still up");
 }
 
 async Task ModemSetupTimeout()
