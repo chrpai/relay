@@ -422,6 +422,8 @@ public sealed class ModemLink
             _state = State.Online;
         }
         await CarrierAsync(true, ct);                       // carrier first, as a modem's DCD
+        if (_options.CarrierToConnectMilliseconds > 0)      // so Image sees it before CONNECT
+            await Task.Delay(_options.CarrierToConnectMilliseconds, ct);
         await ResultAsync(1, ct);                           // CONNECT
     }
 

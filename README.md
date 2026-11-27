@@ -84,6 +84,7 @@ Connections, hangups, and busy and offline callers are logged to the Windows Eve
 | `TelnetDetectMilliseconds` | 0 | How long to watch a new caller for telnet negotiation. 0 turns detection off and the BBS gets plain `CONNECT` |
 | `AnswerQuietMilliseconds` | 1000 | Modem link: a caller is answered only once the BBS has sent no modem commands for this long |
 | `ReinitWaitSeconds` | 30 | Modem link: after a call, the longest a caller waits for the BBS to set up its modem again |
+| `CarrierToConnectMilliseconds` | 500 | Modem link: time between raising carrier and sending `CONNECT`, so Image sees the carrier before it checks for it |
 | `TraceData` | false | Modem link, for troubleshooting: logs every chunk of call data in hex, both ways. Busy; leave it off normally |
 | `Messages.Connected` | `Connecting...` | Sent to the caller just before they're joined. Empty sends nothing |
 | `Messages.Busy` | see above | Sent when the BBS is on another call |

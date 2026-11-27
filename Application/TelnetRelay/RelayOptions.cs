@@ -56,6 +56,14 @@ public sealed class RelayOptions
     /// </summary>
     public bool TraceData { get; set; } = false;
 
+    /// <summary>
+    /// Modem link only. Time between raising carrier and sending CONNECT.
+    /// Image BBS refreshes its carrier flag only now and then, and checks it
+    /// right after CONNECT; with no gap it still reads "no carrier" and sends
+    /// the modem an "at", which the caller sees.
+    /// </summary>
+    public int CarrierToConnectMilliseconds { get; set; } = 500;
+
     public RelayMessages Messages { get; set; } = new();
 }
 

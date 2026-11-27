@@ -496,6 +496,7 @@ sealed class TestRelay : IAsyncDisposable
             TelnetDetectMilliseconds = detectMs,
             AnswerQuietMilliseconds = quietMs,
             ReinitWaitSeconds = reinitSeconds,
+            CarrierToConnectMilliseconds = 100,
         });
         var first = await Task.WhenAny(relay.Started, relay._run).WaitAsync(TimeSpan.FromSeconds(5));
         if (first == relay._run) await relay._run; // surfaces a startup error
