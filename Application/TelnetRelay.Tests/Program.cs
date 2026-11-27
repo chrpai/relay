@@ -43,6 +43,26 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Modem link: +++ inside data is just data", ModemPlusInData),
     ("Modem link: TraceData with TraceFile writes the trace to a file", ModemTraceFile),
     ("Telnet filter: in binary mode CR LF and CR NUL from the client stay data", TelnetBinaryCr),
+    ("Mux: the hello is answered, nodes capped at 4", MuxHello),
+    ("Mux: an unsupported version gets ERROR and is closed", MuxBadVersion),
+    ("Mux: a caller gets Busy while no node is ready", MuxBusyNoNode),
+    ("Mux: a ready node gets CALL, data goes both ways in frames, 0xFF is not doubled", MuxCallData),
+    ("Mux: callers go to the lowest ready node, Busy when none, a node needs READY again after a call", MuxLowestFree),
+    ("Mux: two calls at once stay separate", MuxSeparate),
+    ("Mux: BBS HANGUP closes the caller after what it sent is delivered", MuxBbsHangup),
+    ("Mux: DOWN ends the call and takes the node out", MuxDown),
+    ("Mux: a telnet caller is handled by the relay, CALL says so", MuxTelnet),
+    ("Mux: a raw caller's first bytes reach the BBS after CALL", MuxRawEarly),
+    ("Mux: PING is answered with PONG", MuxPingPong),
+    ("Mux: a frame for a node that does not exist gets ERROR and a close", MuxBadNode),
+    ("Mux: an unknown frame type gets ERROR and a close", MuxBadType),
+    ("Mux: the BBS connection dropping hangs up the callers", MuxLinkGone),
+    ("Mux: a new mux connection replaces the old one", MuxReplaced),
+    ("Mux: frames split across TCP segments are put together", MuxSplitFrames),
+    ("Mux: a caller who is not taking output is hung up without holding up another node", MuxSlowCaller),
+    ("Mux: the relay pings a silent BBS and drops one that does not answer", MuxKeepAlive),
+    ("Mux: a caller waiting for the BBS gets a node when it connects and says READY", MuxGrace),
+    ("Mux: plain BBS and modem link still work beside the new hello", MuxOthersUnchanged),
 };
 
 int failed = 0;
@@ -553,6 +573,336 @@ async Task ModemLinkGone()
     await ExpectClosedAsync(caller, "caller");
 }
 
+
+// ---- Mux ---------------------------------------------------------------------
+
+async Task<MuxBbs> MuxConnect(TestRelay relay, int nodes = 2, params int[] ready)
+{
+    var bbs = await MuxBbs.ConnectAsync(relay, nodes: (byte)nodes);
+    foreach (int n in ready) await bbs.ReadyAsync(n);
+    return bbs;
+}
+
+async Task<string> CallerHello(TcpClient caller, TestRelay relay) =>
+    await ReadExactAsync(caller, relay.Options.Messages.Connected.Length);
+
+async Task MuxHello()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using (var bbs = await MuxBbs.ConnectAsync(relay, nodes: 3))
+        if (!bbs.Hello.SequenceEqual(new byte[] { 0xFF, 0x03, 1, 3 })) throw new Exception("hello answer " + Convert.ToHexString(bbs.Hello));
+    using (var bbs = await MuxBbs.ConnectAsync(relay, nodes: 9))
+        if (!bbs.Hello.SequenceEqual(new byte[] { 0xFF, 0x03, 1, 4 })) throw new Exception("hello answer for 9 nodes " + Convert.ToHexString(bbs.Hello));
+}
+
+async Task MuxBadVersion()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxBbs.ConnectAsync(relay, version: 2, readHello: false);
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 15 || f.Payload.Length != 1 || f.Payload[0] != 3) throw new Exception($"expected ERROR 3, got type {f.Type} {Convert.ToHexString(f.Payload)}");
+    await ExpectClosedAsync(bbs.Tcp, "BBS");
+}
+
+async Task MuxBusyNoNode()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 2);                       // connected, no node ready
+    using var caller = await relay.CallAsync();
+    Expect(await ReadAllAsync(caller), relay.Options.Messages.Busy, "caller text");
+}
+
+async Task MuxCallData()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 2, 1);
+    using var caller = await relay.CallAsync();
+    var call = await bbs.ReadFrameAsync();
+    if (call.Type != 1 || call.Node != 1) throw new Exception($"expected CALL for node 1, got type {call.Type} node {call.Node}");
+    if (call.Payload[0] != 0) throw new Exception("flags should be 0 for a raw caller");
+    Expect(Encoding.Latin1.GetString(call.Payload, 1, call.Payload.Length - 1), "127.0.0.1", "caller address");
+    Expect(await CallerHello(caller, relay), relay.Options.Messages.Connected, "caller text");
+
+    await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("hi"));
+    var d = await bbs.ReadFrameAsync();
+    if (d.Type != 0 || d.Node != 1 || Encoding.Latin1.GetString(d.Payload) != "hi") throw new Exception("caller data frame wrong");
+
+    await bbs.SendAsync(0, 1, Encoding.Latin1.GetBytes("yo"));
+    Expect(await ReadExactAsync(caller, 2), "yo", "text to caller");
+
+    // every byte value, both ways; 300 bytes need two frames from the caller
+    var all = Enumerable.Range(0, 300).Select(i => (byte)i).ToArray();
+    await caller.GetStream().WriteAsync(all);
+    var got = await bbs.ReadDataAsync(1, 300);
+    if (!got.SequenceEqual(all)) throw new Exception("caller to BBS bytes changed");
+    await bbs.SendAsync(0, 1, all.AsSpan(0, 255).ToArray());
+    await bbs.SendAsync(0, 1, all.AsSpan(255).ToArray());
+    var back = await ReadBytesAsync(caller, 300);
+    if (!back.SequenceEqual(all)) throw new Exception("BBS to caller bytes changed (0xFF must not be doubled for a raw caller)");
+}
+
+async Task MuxLowestFree()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 2, 1, 2);
+    using var a = await relay.CallAsync();
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 1 || f.Node != 1) throw new Exception($"first caller should get node 1, got node {f.Node}");
+    using var b = await relay.CallAsync();
+    f = await bbs.ReadFrameAsync();
+    if (f.Type != 1 || f.Node != 2) throw new Exception($"second caller should get node 2, got node {f.Node}");
+    using var c = await relay.CallAsync();
+    Expect(await ReadAllAsync(c), relay.Options.Messages.Busy, "third caller text");
+
+    a.Dispose();                                                      // node 1 caller hangs up
+    f = await bbs.ReadFrameAsync();
+    if (f.Type != 2 || f.Node != 1) throw new Exception($"expected HANGUP for node 1, got type {f.Type} node {f.Node}");
+    using var d = await relay.CallAsync();                            // node 1 is down until READY
+    Expect(await ReadAllAsync(d), relay.Options.Messages.Busy, "caller text before READY");
+    await bbs.ReadyAsync(1);
+    using var e = await relay.CallAsync();
+    f = await bbs.ReadFrameAsync();
+    if (f.Type != 1 || f.Node != 1) throw new Exception($"after READY the caller should get node 1, got node {f.Node}");
+}
+
+async Task MuxSeparate()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 2, 1, 2);
+    using var a = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    using var b = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    await CallerHello(a, relay);
+    await CallerHello(b, relay);
+
+    await bbs.SendAsync(0, 1, Encoding.Latin1.GetBytes("one"));
+    await bbs.SendAsync(0, 2, Encoding.Latin1.GetBytes("two"));
+    Expect(await ReadExactAsync(a, 3), "one", "node 1 caller");
+    Expect(await ReadExactAsync(b, 3), "two", "node 2 caller");
+
+    await b.GetStream().WriteAsync(Encoding.Latin1.GetBytes("from b"));
+    await a.GetStream().WriteAsync(Encoding.Latin1.GetBytes("from a"));
+    var got = new Dictionary<int, string>();
+    while (got.Values.Sum(v => v.Length) < 12)
+    {
+        var f = await bbs.ReadFrameAsync();
+        if (f.Type == 0) got[f.Node] = got.GetValueOrDefault(f.Node, "") + Encoding.Latin1.GetString(f.Payload);
+    }
+    Expect(got[1], "from a", "node 1 data");
+    Expect(got[2], "from b", "node 2 data");
+}
+
+async Task MuxBbsHangup()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    await CallerHello(caller, relay);
+    await bbs.SendAsync(0, 1, Encoding.Latin1.GetBytes("goodbye"));
+    await bbs.SendAsync(2, 1, Array.Empty<byte>());
+    Expect(await ReadAllAsync(caller), "goodbye", "what the caller got before the close");
+    // the node is down until READY: a new caller is busy
+    using var next = await relay.CallAsync();
+    Expect(await ReadAllAsync(next), relay.Options.Messages.Busy, "next caller text");
+}
+
+async Task MuxDown()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    await CallerHello(caller, relay);
+    await bbs.SendAsync(4, 1, Array.Empty<byte>());
+    await ExpectClosedAsync(caller, "caller");
+    await bbs.ReadyAsync(1);                                          // back in service
+    using var again = await relay.CallAsync();
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 1) throw new Exception("a READY after DOWN should take calls again");
+}
+
+async Task MuxTelnet()
+{
+    await using var relay = await TestRelay.StartAsync(detectMs: 400);
+    using var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await caller.GetStream().WriteAsync(new byte[] { 255, 253, 3 });  // IAC DO SGA: a telnet client
+    var call = await bbs.ReadFrameAsync();
+    if (call.Type != 1 || call.Payload[0] != 1) throw new Exception("CALL flags should say telnet");
+    // the relay's offer comes first, then answers; none of it reaches the BBS
+    await Task.Delay(300);
+    await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("a"));
+    var d = await bbs.ReadFrameAsync();
+    if (d.Type != 0 || !d.Payload.SequenceEqual(new byte[] { (byte)'a' })) throw new Exception("BBS should see just the typed byte, got " + Convert.ToHexString(d.Payload));
+    // 0xFF toward a telnet caller is doubled by the relay
+    await bbs.SendAsync(0, 1, new byte[] { 1, 255, 2 });
+    var seen = new List<byte>();
+    var buffer = new byte[256];
+    var deadline = DateTime.UtcNow.AddSeconds(5);
+    while (DateTime.UtcNow < deadline)
+    {
+        int n = await caller.GetStream().ReadAsync(buffer).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        seen.AddRange(buffer.AsSpan(0, n).ToArray());
+        if (seen.Count >= 4 && seen.Skip(seen.Count - 4).SequenceEqual(new byte[] { 1, 255, 255, 2 })) return;
+    }
+    throw new Exception("expected 01 FF FF 02 at the end, got " + Convert.ToHexString(seen.ToArray()));
+}
+
+async Task MuxRawEarly()
+{
+    await using var relay = await TestRelay.StartAsync(detectMs: 400);
+    using var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await caller.GetStream().WriteAsync(Encoding.Latin1.GetBytes("x"));
+    var call = await bbs.ReadFrameAsync();
+    if (call.Type != 1 || call.Payload[0] != 0) throw new Exception("CALL flags should be 0 for a raw caller");
+    var d = await bbs.ReadFrameAsync();
+    if (d.Type != 0 || Encoding.Latin1.GetString(d.Payload) != "x") throw new Exception("the first keystroke should follow CALL");
+}
+
+async Task MuxPingPong()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 1);
+    await bbs.SendAsync(5, 0, new byte[] { 7, 8 });
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 6 || !f.Payload.SequenceEqual(new byte[] { 7, 8 })) throw new Exception("expected PONG with the same payload");
+}
+
+async Task MuxBadNode()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 2);
+    await bbs.SendAsync(3, 3, Array.Empty<byte>());                   // READY for node 3 of 2
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 15 || f.Payload[0] != 2) throw new Exception("expected ERROR 2");
+    await ExpectClosedAsync(bbs.Tcp, "BBS");
+}
+
+async Task MuxBadType()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 2);
+    await bbs.SendAsync(9, 1, Array.Empty<byte>());
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 15 || f.Payload[0] != 1) throw new Exception("expected ERROR 1");
+    await ExpectClosedAsync(bbs.Tcp, "BBS");
+}
+
+async Task MuxLinkGone()
+{
+    await using var relay = await TestRelay.StartAsync();
+    var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    await CallerHello(caller, relay);
+    bbs.Dispose();
+    await ExpectClosedAsync(caller, "caller");
+}
+
+async Task MuxReplaced()
+{
+    await using var relay = await TestRelay.StartAsync();
+    var first = await MuxConnect(relay, 1, 1);
+    using var second = await MuxConnect(relay, 1, 1);
+    await ExpectClosedAsync(first.Tcp, "first mux");
+    using var caller = await relay.CallAsync();
+    var f = await second.ReadFrameAsync();
+    if (f.Type != 1) throw new Exception("the new connection should get the call");
+}
+
+async Task MuxSplitFrames()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    await CallerHello(caller, relay);
+    var frame = new byte[] { 0x01, 5, (byte)'a', (byte)'b', (byte)'c', (byte)'d', (byte)'e' };
+    foreach (var b in frame)                                          // one byte at a time
+    {
+        await bbs.Tcp.GetStream().WriteAsync(new[] { b });
+        await Task.Delay(30);
+    }
+    Expect(await ReadExactAsync(caller, 5), "abcde", "text to caller");
+}
+
+async Task MuxSlowCaller()
+{
+    await using var relay = await TestRelay.StartAsync(muxBuffer: 8192);
+    using var bbs = await MuxConnect(relay, 2, 1, 2);
+    using var slow = await relay.CallAsync();                         // node 1: never reads
+    await bbs.ReadFrameAsync();
+    using var fast = await relay.CallAsync();                         // node 2: reads
+    await bbs.ReadFrameAsync();
+    await CallerHello(fast, relay);
+
+    var chunk = new byte[255];
+    Array.Fill(chunk, (byte)'x');
+    // flood node 1 until the relay gives up on that caller (it sends HANGUP)
+    var hangup = Task.Run(async () =>
+    {
+        while (true)
+        {
+            var f = await bbs.ReadFrameAsync(30000);
+            if (f.Type == 2 && f.Node == 1) return;
+        }
+    });
+    int sent = 0;
+    while (!hangup.IsCompleted && sent < 200_000)
+    {
+        await bbs.SendAsync(0, 1, chunk);
+        sent++;
+        if (sent == 2000)
+        {
+            await bbs.SendAsync(0, 2, Encoding.Latin1.GetBytes("ping"));
+            Expect(await ReadExactAsync(fast, 4), "ping", "the other node's caller, while node 1 is backed up");
+        }
+    }
+    await hangup.WaitAsync(TimeSpan.FromSeconds(30));
+    await bbs.SendAsync(0, 2, Encoding.Latin1.GetBytes("pong"));
+    Expect(await ReadExactAsync(fast, 4), "pong", "the other node's caller afterwards");
+}
+
+async Task MuxKeepAlive()
+{
+    await using var relay = await TestRelay.StartAsync(muxPing: 1, muxPong: 1);
+    using var bbs = await MuxConnect(relay, 1);
+    var f = await bbs.ReadFrameAsync(4000);
+    if (f.Type != 5 || f.Node != 0) throw new Exception("expected a PING after a quiet second");
+    await bbs.SendAsync(6, 0, f.Payload);                             // answer it: stays up
+    f = await bbs.ReadFrameAsync(4000);
+    if (f.Type != 5) throw new Exception("expected another PING");
+    await ExpectClosedAsync(bbs.Tcp, "BBS");                          // this one is not answered
+}
+
+async Task MuxGrace()
+{
+    await using var relay = await TestRelay.StartAsync(grace: 4);
+    using var caller = await relay.CallAsync();                       // no BBS yet: waits
+    await Task.Delay(300);
+    using var bbs = await MuxConnect(relay, 1, 1);
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 1 || f.Node != 1) throw new Exception("the waiting caller should get node 1");
+    Expect(await CallerHello(caller, relay), relay.Options.Messages.Connected, "caller text");
+}
+
+async Task MuxOthersUnchanged()
+{
+    await using var relay = await TestRelay.StartAsync();
+    // a plain BBS (no hello) still gets CONNECT
+    using (var plain = await relay.BbsAsync())
+    using (var caller = await relay.CallAsync())
+        Expect(await ReadExactAsync(plain, "CONNECT\r\n".Length), "CONNECT\r\n", "plain BBS text");
+    await Task.Delay(300);
+    // a modem link (hello FF 02) still answers AT
+    using var modem = await Modem(relay);
+    await Send(modem, "AT\r");
+    Expect(await ReadExactAsync(modem, 2), "OK".Substring(0, 0) + "0\r", "modem answer");
+}
+
 // ---- Helpers -----------------------------------------------------------------
 
 static void Expect(string actual, string expected, string what)
@@ -595,6 +945,71 @@ static async Task ExpectClosedAsync(TcpClient client, string who)
     catch (TimeoutException) { throw new Exception($"{who} connection was not closed"); }
 }
 
+
+/// <summary>A BBS that speaks the mux protocol.</summary>
+sealed class MuxBbs : IDisposable
+{
+    public TcpClient Tcp { get; }
+    public byte[] Hello { get; private set; } = Array.Empty<byte>();
+    private readonly NetworkStream _s;
+
+    private MuxBbs(TcpClient tcp) { Tcp = tcp; _s = tcp.GetStream(); }
+
+    public static async Task<MuxBbs> ConnectAsync(TestRelay relay, byte version = 1, byte nodes = 2, bool readHello = true)
+    {
+        var tcp = new TcpClient();
+        await tcp.ConnectAsync(IPAddress.Loopback, relay.Options.BbsPort);
+        var bbs = new MuxBbs(tcp);
+        await bbs._s.WriteAsync(new byte[] { 0xFF, 0x03, version, nodes });
+        if (readHello)
+        {
+            var hello = new byte[4];
+            await bbs._s.ReadExactlyAsync(hello).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            bbs.Hello = hello;
+        }
+        return bbs;
+    }
+
+    public async Task SendAsync(int type, int node, byte[] payload)
+    {
+        var buf = new byte[2 + payload.Length];
+        buf[0] = (byte)((type << 4) | node);
+        buf[1] = (byte)payload.Length;
+        payload.CopyTo(buf, 2);
+        await _s.WriteAsync(buf);
+    }
+
+    public async Task ReadyAsync(int node)
+    {
+        await SendAsync(3, node, Array.Empty<byte>());
+        await Task.Delay(100);                                        // let the relay register it
+    }
+
+    public async Task<(int Type, int Node, byte[] Payload)> ReadFrameAsync(int timeoutMs = 5000)
+    {
+        var header = new byte[2];
+        await _s.ReadExactlyAsync(header).AsTask().WaitAsync(TimeSpan.FromMilliseconds(timeoutMs));
+        var payload = new byte[header[1]];
+        if (payload.Length > 0)
+            await _s.ReadExactlyAsync(payload).AsTask().WaitAsync(TimeSpan.FromMilliseconds(timeoutMs));
+        return (header[0] >> 4, header[0] & 0x0F, payload);
+    }
+
+    /// <summary>Collects DATA frames for one node until <paramref name="count"/> bytes have arrived.</summary>
+    public async Task<byte[]> ReadDataAsync(int node, int count)
+    {
+        var got = new List<byte>();
+        while (got.Count < count)
+        {
+            var f = await ReadFrameAsync();
+            if (f.Type == 0 && f.Node == node) got.AddRange(f.Payload);
+        }
+        return got.ToArray();
+    }
+
+    public void Dispose() => Tcp.Dispose();
+}
+
 sealed class TestRelay : IAsyncDisposable
 {
     public RelayOptions Options { get; }
@@ -615,7 +1030,8 @@ sealed class TestRelay : IAsyncDisposable
 
     private Task Started { get; }
 
-    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0, int quietMs = 200, int reinitSeconds = 30, string? trace = null)
+    public static async Task<TestRelay> StartAsync(int grace = 2, int detectMs = 0, int quietMs = 200, int reinitSeconds = 30, string? trace = null,
+        int muxBuffer = 16384, int muxPing = 60, int muxPong = 10)
     {
         var relay = new TestRelay(new RelayOptions
         {
@@ -628,6 +1044,9 @@ sealed class TestRelay : IAsyncDisposable
             CarrierToConnectMilliseconds = 100,
             TraceData = trace != null,
             TraceFile = trace ?? "",
+            MuxNodeBufferBytes = muxBuffer,
+            MuxPingSeconds = muxPing,
+            MuxPongSeconds = muxPong,
         });
         var first = await Task.WhenAny(relay.Started, relay._run).WaitAsync(TimeSpan.FromSeconds(5));
         if (first == relay._run) await relay._run; // surfaces a startup error

@@ -170,3 +170,13 @@ These are scenario tests with real sockets on local ports: offline, connected, b
 ## License
 
 MIT
+
+## Mux mode (multinode BBS)
+
+A BBS that runs several nodes over one TCP connection can send the hello `FF 03 <version> <nodes>` right after it connects to the BBS port. The relay answers with the same four bytes (nodes capped at 4) and then both sides exchange frames: `<type<<4 | node> <len> <payload>`.
+
+Types: 0 DATA, 1 CALL (relay to BBS; flags byte, bit 0 = telnet caller, then the caller's address), 2 HANGUP, 3 READY, 4 DOWN, 5 PING, 6 PONG, 15 ERROR (1 bad frame, 2 unknown node, 3 version). A caller goes to the lowest READY node; a node is down after a call until the BBS sends READY again. Telnet negotiation stays in the relay, so the BBS sees plain bytes. See the UltimateBoard `docs/mux-protocol.md` for the full spec.
+
+Settings: `MuxNodeBufferBytes` (default 16384, a caller whose queued output goes past this is hung up), `MuxPingSeconds` (60), `MuxPongSeconds` (10).
+
+The plain mode and the `FF 02` modem link are unchanged. Using a modem link and a mux link at the same time is not supported in this version.

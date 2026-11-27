@@ -32,6 +32,7 @@ public sealed class RelayEngine
     private TaskCompletionSource<object>? _callerWaitingForBbs;   // caller inside the reconnect grace period:
                                                                   // gets a Socket (plain BBS) or a ModemLink
     private readonly List<ModemLink> _links = new();              // BBSes that use the relay as their modem
+    private MuxLink? _mux;                                        // a BBS that sends all its nodes over one connection
     private int _activeCalls;
 
     /// <summary>How long a new BBS connection is watched for the modem hello ($FF $02).</summary>
@@ -146,6 +147,34 @@ public sealed class RelayEngine
             await RunModemLinkAsync(bbs, who, ct);
             return;
         }
+
+        // ...or says $FF $03 version nodes: all its nodes share this connection (mux mode)
+        if (first.Length == 2 && first.Span[0] == 0xff && first.Span[1] == 0x03)
+        {
+            var rest = await ReadEarlyBytesAsync(bbs, HelloMilliseconds * 3, 2, ct);
+            if (rest.Length < 2)
+            {
+                _log(RelayLogLevel.Warning, $"BBS {who} sent an incomplete mux hello; dropped.");
+                Close(bbs);
+                return;
+            }
+            if (rest.Span[0] != MuxLink.Version)
+            {
+                _log(RelayLogLevel.Warning, $"BBS {who} asked for mux version {rest.Span[0]}, which is not supported.");
+                await MuxLink.RejectAsync(bbs, MuxLink.ErrVersion, ct);
+                Close(bbs);
+                return;
+            }
+            if (rest.Span[1] == 0)
+            {
+                _log(RelayLogLevel.Warning, $"BBS {who} asked for no nodes; dropped.");
+                await MuxLink.RejectAsync(bbs, MuxLink.ErrBadFrame, ct);
+                Close(bbs);
+                return;
+            }
+            await RunMuxLinkAsync(bbs, who, rest.Span[1], ct);
+            return;
+        }
         if (first.Length > 0)
         {
             _log(RelayLogLevel.Warning, $"BBS {who} sent data before any caller; dropped it.");
@@ -206,6 +235,51 @@ public sealed class RelayEngine
         }
     }
 
+    private async Task RunMuxLinkAsync(Socket bbs, string who, int nodes, CancellationToken ct)
+    {
+        var link = new MuxLink(bbs, who, nodes, _options, _log, MuxNodeAvailable);
+        MuxLink? replaced;
+        lock (_gate)
+        {
+            replaced = _mux;
+            _mux = link;
+        }
+        if (replaced != null)
+        {
+            _log(RelayLogLevel.Warning, $"Dropped the previous mux connection from {replaced.Who}.");
+            replaced.Close();
+        }
+        _log(RelayLogLevel.Information, $"BBS connected from {who} in mux mode with {link.Nodes} node(s); waiting for ready nodes.");
+        try
+        {
+            await link.RunAsync(ct);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (_mux == link) _mux = null;
+            }
+            _log(RelayLogLevel.Information, $"Mux connection from {who} closed.");
+        }
+    }
+
+    /// <summary>A mux node became ready: give it to a caller who is waiting, if any.</summary>
+    private void MuxNodeAvailable(MuxLink link)
+    {
+        TaskCompletionSource<object>? handTo = null;
+        MuxReservation? res = null;
+        lock (_gate)
+        {
+            if (_callerWaitingForBbs != null && (res = link.TryReserve()) != null)
+            {
+                handTo = _callerWaitingForBbs;
+                _callerWaitingForBbs = null;
+            }
+        }
+        handTo?.TrySetResult(res!);
+    }
+
     /// <summary>A modem link is idle again: give it to a caller who is waiting, if any.</summary>
     private void LinkAvailable(ModemLink link)
     {
@@ -232,12 +306,13 @@ public sealed class RelayEngine
 
         lock (_gate)
         {
-            bbs = (object?)TakeWaitingBbs() ?? _links.FirstOrDefault(l => l.TryReserve());
+            bbs = (object?)TakeWaitingBbs() ?? _links.FirstOrDefault(l => l.TryReserve())
+                ?? (object?)_mux?.TryReserve();
             if (bbs != null)
             {
                 _activeCalls++;
             }
-            else if (_activeCalls > 0 || _callerWaitingForBbs != null || _links.Count > 0)
+            else if (_activeCalls > 0 || _callerWaitingForBbs != null || _links.Count > 0 || _mux != null)
             {
                 busy = true;
             }
@@ -287,6 +362,8 @@ public sealed class RelayEngine
         {
             if (bbs is ModemLink link)
                 await RunModemCallAsync(caller, link, who, ct);
+            else if (bbs is MuxReservation res)
+                await RunMuxCallAsync(caller, res, who, ct);
             else
                 await RunCallAsync(caller, (Socket)bbs!, who, ct);
         }
@@ -307,6 +384,34 @@ public sealed class RelayEngine
         _log(RelayLogLevel.Information, $"The idle BBS connection from {Describe(bbs)} had closed.");
         Close(bbs);
         return null;
+    }
+
+    private async Task RunMuxCallAsync(Socket caller, MuxReservation res, string who, CancellationToken ct)
+    {
+        try
+        {
+            ReadOnlyMemory<byte> early = ReadOnlyMemory<byte>.Empty;
+            bool telnet = false;
+            if (_options.TelnetDetectMilliseconds > 0)
+            {
+                early = await ReadEarlyBytesAsync(caller, _options.TelnetDetectMilliseconds, 512, ct);
+                telnet = early.Length > 0 && early.Span[0] == 0xFF; // IAC
+            }
+            if (!await res.Link.CallAsync(res.Node, caller, who, telnet, early, ct))
+            {
+                _log(RelayLogLevel.Information, $"Node {res.Node} was no longer available; caller {who} got the busy message.");
+                await SendAndCloseAsync(caller, _options.Messages.Busy, ct);
+            }
+        }
+        catch (SocketException ex)
+        {
+            _log(RelayLogLevel.Information, $"Call from {who} ended: {ex.Message}");
+        }
+        finally
+        {
+            res.Link.Release(res.Node);                  // does nothing if the call used the node
+            Close(caller);
+        }
     }
 
     private async Task RunModemCallAsync(Socket caller, ModemLink link, string who, CancellationToken ct)

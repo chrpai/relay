@@ -71,6 +71,19 @@ public sealed class RelayOptions
     /// </summary>
     public int CarrierToConnectMilliseconds { get; set; } = 500;
 
+    /// <summary>
+    /// Mux mode only. Output a node's caller has not yet taken, in bytes. A
+    /// caller that falls this far behind is hung up, so one slow caller can
+    /// not use up the relay's memory or hold up the other nodes.
+    /// </summary>
+    public int MuxNodeBufferBytes { get; set; } = 16384;
+
+    /// <summary>Mux mode only. A BBS that has said nothing for this long is sent a ping.</summary>
+    public int MuxPingSeconds { get; set; } = 60;
+
+    /// <summary>Mux mode only. A BBS that does not answer a ping within this long is disconnected.</summary>
+    public int MuxPongSeconds { get; set; } = 10;
+
     public RelayMessages Messages { get; set; } = new();
 }
 
