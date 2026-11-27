@@ -14,6 +14,7 @@ public sealed class TelnetFilter
 
     private readonly bool[] _we = new bool[256];    // options we have on
     private readonly bool[] _they = new bool[256];  // options the client has on
+    private readonly bool[] _asked = new bool[256]; // we sent DO, no answer yet
     private int _state;                             // 0 data, 1 after IAC, 2 option verb, 3 in SB, 4 IAC in SB
     private byte _verb;
     private bool _afterCr;
@@ -25,7 +26,7 @@ public sealed class TelnetFilter
     public byte[] Offer()
     {
         _we[ECHO] = _we[SGA] = _we[BINARY] = true;
-        _they[SGA] = _they[BINARY] = true;
+        _asked[SGA] = _asked[BINARY] = true;           // on once the client says WILL
         return new byte[]
         {
             IAC, WILL, ECHO, IAC, WILL, SGA, IAC, DO, SGA,
@@ -45,8 +46,10 @@ public sealed class TelnetFilter
             {
                 case 0:
                     if (b == IAC) { _state = 1; break; }
-                    if (_afterCr && (b == 0 || b == 10)) { _afterCr = false; break; } // CR NUL, CR LF: just CR
-                    _afterCr = b == 13;
+                    // CR NUL / CR LF is just CR, but only in text mode: in
+                    // binary mode (a file upload) every byte is data
+                    if (_afterCr && (b == 0 || b == 10)) { _afterCr = false; break; }
+                    _afterCr = b == 13 && !_they[BINARY];
                     data.Add(b);
                     break;
                 case 1:
@@ -81,11 +84,17 @@ public sealed class TelnetFilter
                 if (_we[opt]) { _we[opt] = false; reply.AddRange(new[] { IAC, WONT, opt }); }
                 break;
             case WILL:
-                if (TheyMay(opt)) { if (!_they[opt]) { _they[opt] = true; reply.AddRange(new[] { IAC, DO, opt }); } }
+                if (TheyMay(opt))
+                {
+                    if (!_they[opt] && !_asked[opt]) reply.AddRange(new[] { IAC, DO, opt });
+                    _they[opt] = true;                      // (an answer to our DO needs none)
+                    _asked[opt] = false;
+                }
                 else reply.AddRange(new[] { IAC, DONT, opt });
                 break;
             case WONT:
                 if (_they[opt]) { _they[opt] = false; reply.AddRange(new[] { IAC, DONT, opt }); }
+                _asked[opt] = false;                        // (a refusal of our DO needs none)
                 break;
         }
     }

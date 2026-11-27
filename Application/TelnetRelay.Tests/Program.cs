@@ -42,6 +42,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Modem link: escape then ATO goes back online", ModemEscapeOnline),
     ("Modem link: +++ inside data is just data", ModemPlusInData),
     ("Modem link: TraceData with TraceFile writes the trace to a file", ModemTraceFile),
+    ("Telnet filter: in binary mode CR LF and CR NUL from the client stay data", TelnetBinaryCr),
 };
 
 int failed = 0;
@@ -443,6 +444,23 @@ async Task ModemPlusInData()
     await Send(bbs, "x");
     Expect(await ReadExactAsync(caller, 1), "x", "still online");
     if (bbs.Available > 0) throw new Exception("the relay answered: " + bbs.Available + " bytes");
+}
+
+Task TelnetBinaryCr()
+{
+    var f = new TelnetFilter();
+    f.Offer();                                                // asks for binary both ways
+    var data = new List<byte>(); var reply = new List<byte>();
+    f.FromClient(new byte[] { 255, 251, 0 }, data, reply);    // IAC WILL BINARY
+    f.FromClient(new byte[] { 13, 10, 13, 0, 13, 13, 65 }, data, reply);
+    if (!data.SequenceEqual(new byte[] { 13, 10, 13, 0, 13, 13, 65 }))
+        throw new Exception("binary mode changed the data: " + Convert.ToHexString(data.ToArray()));
+    var text = new TelnetFilter();                            // a client in text mode
+    data.Clear();
+    text.FromClient(new byte[] { 13, 10, 65, 13, 0 }, data, reply);
+    if (!data.SequenceEqual(new byte[] { 13, 65, 13 }))
+        throw new Exception("text mode: " + Convert.ToHexString(data.ToArray()));
+    return Task.CompletedTask;
 }
 
 async Task ModemTraceFile()
