@@ -38,6 +38,7 @@ public sealed class MuxLink
         public long Pending;                          // bytes in Out
         public CancellationTokenSource End = null!;   // cancelled to end the call
         public bool EndedByBbs;                       // the BBS ended it (or the link died): no HANGUP to send
+        public bool ReadyAfter;                       // the BBS sent READY while this call was still winding down
     }
 
     private sealed class Node
@@ -184,6 +185,8 @@ public sealed class MuxLink
                 lock (_lock)
                 {
                     if (n.State == NodeState.Down) { n.State = NodeState.Ready; becameReady = true; }
+                    // HANGUP then READY straight away: the call is still flushing, so remember it
+                    else if (n.State == NodeState.InCall && n.Current is { EndedByBbs: true } cur) cur.ReadyAfter = true;
                 }
                 break;
             case Down:
@@ -391,7 +394,7 @@ public sealed class MuxLink
             c.End.Cancel();
             if (writer != null) { try { await writer; } catch { } }
 
-            bool tell;
+            bool tell, nowReady = false;
             lock (_lock)
             {
                 tell = !c.EndedByBbs && !_dead && n.Current == c && n.State == NodeState.InCall;
@@ -399,8 +402,10 @@ public sealed class MuxLink
                 {
                     n.Current = null;
                     if (n.State == NodeState.InCall) n.State = NodeState.Down;   // until the BBS says READY
+                    if (c.ReadyAfter && !_dead && n.State == NodeState.Down) { n.State = NodeState.Ready; nowReady = true; }
                 }
             }
+            if (nowReady) _available(this);
             if (tell && !ct.IsCancellationRequested)
             {
                 try { await SendFrameAsync(Hangup, node, Array.Empty<byte>(), CancellationToken.None); }

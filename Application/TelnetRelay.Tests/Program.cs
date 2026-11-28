@@ -51,6 +51,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Mux: two calls at once stay separate", MuxSeparate),
     ("Mux: BBS HANGUP closes the caller after what it sent is delivered", MuxBbsHangup),
     ("Mux: DOWN ends the call and takes the node out", MuxDown),
+    ("Mux: READY sent right after HANGUP is not lost", MuxReadyAfterHangup),
     ("Mux: a telnet caller is handled by the relay, CALL says so", MuxTelnet),
     ("Mux: a raw caller's first bytes reach the BBS after CALL", MuxRawEarly),
     ("Mux: PING is answered with PONG", MuxPingPong),
@@ -706,6 +707,23 @@ async Task MuxBbsHangup()
     // the node is down until READY: a new caller is busy
     using var next = await relay.CallAsync();
     Expect(await ReadAllAsync(next), relay.Options.Messages.Busy, "next caller text");
+}
+
+async Task MuxReadyAfterHangup()
+{
+    await using var relay = await TestRelay.StartAsync();
+    using var bbs = await MuxConnect(relay, 1, 1);
+    using var caller = await relay.CallAsync();
+    await bbs.ReadFrameAsync();
+    await CallerHello(caller, relay);
+    await bbs.SendAsync(0, 1, Encoding.Latin1.GetBytes("bye"));
+    await bbs.SendAsync(2, 1, Array.Empty<byte>());
+    await bbs.SendAsync(3, 1, Array.Empty<byte>());                   // no pause: the call is still flushing
+    Expect(await ReadAllAsync(caller), "bye", "what the caller got");
+    await Task.Delay(300);
+    using var next = await relay.CallAsync();
+    var f = await bbs.ReadFrameAsync();
+    if (f.Type != 1 || f.Node != 1) throw new Exception("the node should be ready again after HANGUP + READY");
 }
 
 async Task MuxDown()
